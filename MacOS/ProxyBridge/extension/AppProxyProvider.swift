@@ -270,6 +270,32 @@ struct ProxyRule: Codable {
     }
 }
 
+private struct KokoroBoxRule: Codable {
+    let signingIdentifier: String
+    let ruleProtocol: RuleProtocol
+    let action: String
+    let enabled: Bool
+    let priority: Int
+}
+
+private struct KokoroBoxConfiguration: Codable {
+    let version: Int
+    let failClosed: Bool
+    let proxyAvailable: Bool
+    let proxyHost: String
+    let proxyPort: Int
+    let diagnosticLogging: Bool
+    let rules: [KokoroBoxRule]
+}
+
+private enum KokoroBoxConfigurationError: LocalizedError {
+    case invalid
+
+    var errorDescription: String? {
+        "Invalid KokoroBox application-routing configuration"
+    }
+}
+
 class AppProxyProvider: NETransparentProxyProvider {
     
     // one log entry, kept as an enum so we don't allocate a dictionary per line,
@@ -291,6 +317,24 @@ class AppProxyProvider: NETransparentProxyProvider {
 
     // circular buffer for logs, avoids shifting the whole array on every pop
     private static let logCapacity = 500
+    private static let kokoroBoxExcludedNetworkRules: [NENetworkRule] = [
+        ("127.0.0.0", 8),
+        ("169.254.0.0", 16),
+        ("224.0.0.0", 4),
+        ("255.255.255.255", 32),
+        ("::1", 128),
+        ("fe80::", 10),
+        ("ff00::", 8)
+    ].map { address, prefix in
+        NENetworkRule(
+            remoteNetwork: NWHostEndpoint(hostname: address, port: "0"),
+            remotePrefix: prefix,
+            localNetwork: nil,
+            localPrefix: 0,
+            protocol: .any,
+            direction: .outbound
+        )
+    }
     private var logBuffer = [LogEntry?](repeating: nil, count: AppProxyProvider.logCapacity)
     private var logHead = 0
     private var logTail = 0
@@ -367,6 +411,145 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     private var storedProxyConfigs: [String: StoredProxyConfig] = [:]
     private let proxyLock = NSLock()
+
+    private var kokoroBoxConfiguration: KokoroBoxConfiguration?
+    private let kokoroBoxConfigurationLock = NSLock()
+    private static let directSigningIdentifierPatterns = [
+        "com.amamiyakokoro.app",
+        "com.amamiyakokoro.app.*",
+        "kokorobox-app-routing-bridge",
+        "mihomo",
+        "mihomo-alpha"
+    ]
+
+    private enum KokoroBoxDecision {
+        case direct
+        case block
+        case proxy(StoredProxyConfig)
+    }
+
+    private static func globMatch(_ pattern: String, _ value: String) -> Bool {
+        let pattern = Array(pattern.lowercased())
+        let value = Array(value.lowercased())
+        var patternIndex = 0
+        var valueIndex = 0
+        var starIndex: Int?
+        var retryValueIndex = 0
+        while valueIndex < value.count {
+            if patternIndex < pattern.count, pattern[patternIndex] == value[valueIndex] {
+                patternIndex += 1
+                valueIndex += 1
+            } else if patternIndex < pattern.count, pattern[patternIndex] == "*" {
+                starIndex = patternIndex
+                retryValueIndex = valueIndex
+                patternIndex += 1
+            } else if let starIndex {
+                patternIndex = starIndex + 1
+                retryValueIndex += 1
+                valueIndex = retryValueIndex
+            } else {
+                return false
+            }
+        }
+        while patternIndex < pattern.count, pattern[patternIndex] == "*" {
+            patternIndex += 1
+        }
+        return patternIndex == pattern.count
+    }
+
+    private static func validSigningIdentifier(_ value: String) -> Bool {
+        guard !value.isEmpty, value != "*", value.utf8.count <= 512 else { return false }
+        return value.unicodeScalars.allSatisfy {
+            $0.value >= 0x21 && $0.value <= 0x7e && !";,?\\/\"".unicodeScalars.contains($0)
+        }
+    }
+
+    private func validatedKokoroBoxConfiguration(_ data: Data) throws -> KokoroBoxConfiguration {
+        let configuration = try JSONDecoder().decode(KokoroBoxConfiguration.self, from: data)
+        guard configuration.version == 1,
+              configuration.failClosed,
+              configuration.proxyHost == "127.0.0.1",
+              configuration.proxyPort == 7891,
+              configuration.rules.count <= 256 else {
+            throw KokoroBoxConfigurationError.invalid
+        }
+        var priorities = Set<Int>()
+        var identifiers = Set<String>()
+        for rule in configuration.rules {
+            let identifier = rule.signingIdentifier.lowercased()
+            guard Self.validSigningIdentifier(rule.signingIdentifier),
+                  ["PROXY", "DIRECT", "BLOCK"].contains(rule.action),
+                  rule.priority > 0,
+                  rule.priority <= 256,
+                  priorities.insert(rule.priority).inserted,
+                  identifiers.insert(identifier).inserted else {
+                throw KokoroBoxConfigurationError.invalid
+            }
+        }
+        return configuration
+    }
+
+    private func installKokoroBoxConfiguration(_ data: Data) throws {
+        let configuration = try validatedKokoroBoxConfiguration(data)
+        kokoroBoxConfigurationLock.lock()
+        kokoroBoxConfiguration = configuration
+        kokoroBoxConfigurationLock.unlock()
+        trafficLoggingEnabled = configuration.diagnosticLogging
+        log("KokoroBox policy replaced atomically: \(configuration.rules.count) rule(s)")
+    }
+
+    private func currentKokoroBoxConfiguration() -> KokoroBoxConfiguration? {
+        kokoroBoxConfigurationLock.lock()
+        defer { kokoroBoxConfigurationLock.unlock() }
+        return kokoroBoxConfiguration
+    }
+
+    private func kokoroBoxDecision(
+        signingIdentifier: String,
+        connectionProtocol: RuleProtocol
+    ) -> KokoroBoxDecision? {
+        guard let configuration = currentKokoroBoxConfiguration() else { return nil }
+        if Self.directSigningIdentifierPatterns.contains(where: {
+            Self.globMatch($0, signingIdentifier)
+        }) {
+            return .direct
+        }
+        let rule = configuration.rules
+            .filter { $0.enabled }
+            .sorted { $0.priority < $1.priority }
+            .first {
+                ($0.ruleProtocol == .both || $0.ruleProtocol == connectionProtocol) &&
+                Self.globMatch($0.signingIdentifier, signingIdentifier)
+            }
+        guard let rule else { return .direct }
+        switch rule.action {
+        case "DIRECT":
+            return .direct
+        case "BLOCK":
+            return .block
+        default:
+            guard configuration.proxyAvailable else { return .block }
+            return .proxy(StoredProxyConfig(
+                type: "socks5",
+                host: configuration.proxyHost,
+                port: configuration.proxyPort,
+                username: nil,
+                password: nil
+            ))
+        }
+    }
+
+    private static func isDirectNetworkTarget(_ destination: String) -> Bool {
+        let value = destination.lowercased()
+        if value == "localhost" || value == "::1" || value.hasPrefix("fe80:") || value.hasPrefix("ff") {
+            return true
+        }
+        let octets = value.split(separator: ".").compactMap { UInt8($0) }
+        guard octets.count == 4 else { return false }
+        if octets[0] == 127 || (octets[0] == 169 && octets[1] == 254) { return true }
+        if octets[0] >= 224 { return true }
+        return octets[3] == 255
+    }
     
     private func log(_ message: String, level: String = "INFO") {
         appendLog(.activity(timestamp: dateFormatter.string(from: Date()), level: level, message: message))
@@ -386,6 +569,15 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
+        if let tunnelProtocol = protocolConfiguration as? NETunnelProviderProtocol,
+           let data = tunnelProtocol.providerConfiguration?["kokoroBoxConfiguration"] as? Data {
+            do {
+                try installKokoroBoxConfiguration(data)
+            } catch {
+                completionHandler(error)
+                return
+            }
+        }
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         
         let allTrafficRule = NENetworkRule(
@@ -398,6 +590,9 @@ class AppProxyProvider: NETransparentProxyProvider {
         )
         
         settings.includedNetworkRules = [allTrafficRule]
+        if currentKokoroBoxConfiguration() != nil {
+            settings.excludedNetworkRules = Self.kokoroBoxExcludedNetworkRules
+        }
         
         self.setTunnelNetworkSettings(settings) { error in
             completionHandler(error)
@@ -405,6 +600,9 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     
     override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        kokoroBoxConfigurationLock.lock()
+        kokoroBoxConfiguration = nil
+        kokoroBoxConfigurationLock.unlock()
         udpLock.lock()
         let all = Array(udpAssociations.values)
         udpAssociations.removeAll()
@@ -444,6 +642,32 @@ class AppProxyProvider: NETransparentProxyProvider {
         }
         
         switch action {
+        case "replaceKokoroBoxConfiguration":
+            do {
+                guard let rawConfiguration = message["configuration"] else {
+                    throw KokoroBoxConfigurationError.invalid
+                }
+                let data = try JSONSerialization.data(withJSONObject: rawConfiguration)
+                try installKokoroBoxConfiguration(data)
+                completionHandler?(try JSONSerialization.data(withJSONObject: [
+                    "status": "ok",
+                    "version": 1
+                ]))
+            } catch {
+                completionHandler?(try? JSONSerialization.data(withJSONObject: [
+                    "status": "error",
+                    "message": "invalid_configuration"
+                ]))
+            }
+        case "getKokoroBoxStatus":
+            let configuration = currentKokoroBoxConfiguration()
+            completionHandler?(try? JSONSerialization.data(withJSONObject: [
+                "status": "ok",
+                "version": 1,
+                "configured": configuration != nil,
+                "proxyAvailable": configuration?.proxyAvailable ?? false,
+                "ruleCount": configuration?.rules.count ?? 0
+            ]))
         case "getLogs":
             logQueueLock.lock()
             if logCount > 0 {
@@ -574,6 +798,21 @@ class AppProxyProvider: NETransparentProxyProvider {
             destination = String(describing: remoteEndpoint)
             portStr = "unknown"
         }
+
+        if currentKokoroBoxConfiguration() != nil {
+            guard !Self.isDirectNetworkTarget(destination) else { return false }
+            switch kokoroBoxDecision(signingIdentifier: processPath, connectionProtocol: .tcp) {
+            case .direct, .none:
+                return false
+            case .block:
+                flow.closeReadWithError(nil)
+                flow.closeWriteWithError(nil)
+                return true
+            case .proxy(let configuration):
+                proxyTCPFlow(flow, destination: destination, port: portNum, config: configuration)
+                return true
+            }
+        }
         
         let processName = getProcessName(from: metaData)
         let displayName = processName ?? processPath
@@ -633,6 +872,28 @@ class AppProxyProvider: NETransparentProxyProvider {
         let processPath = metaData.sourceAppSigningIdentifier
         let processName = getProcessName(from: metaData)
         let displayName = processName ?? processPath
+
+        if currentKokoroBoxConfiguration() != nil {
+            switch kokoroBoxDecision(signingIdentifier: processPath, connectionProtocol: .udp) {
+            case .direct, .none:
+                return false
+            case .block:
+                return true
+            case .proxy(let configuration):
+                flow.open(withLocalEndpoint: nil) { [weak self] error in
+                    guard error == nil, let self else { return }
+                    self.proxyUDPFlowViaSOCKS5(
+                        flow,
+                        displayName: displayName,
+                        socksHost: configuration.host,
+                        socksPort: configuration.port,
+                        username: nil,
+                        password: nil
+                    )
+                }
+                return true
+            }
+        }
         
         if processPath == "com.interceptsuite.ProxyBridge" || processPath == "com.interceptsuite.ProxyBridge.extension" {
             return false
@@ -1449,5 +1710,3 @@ class AppProxyProvider: NETransparentProxyProvider {
         appendLog(.connection(proto: `protocol`, process: process, destination: destination, port: port, proxy: proxy))
     }
 }
-
-
