@@ -38,9 +38,9 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
     {
         PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
         if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;  // Fail closed: never leak a PROXY rule to direct
         if (is_udp && cfg->type == PROXY_TYPE_HTTP)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;
     }
     if (out_proxy_config_id) *out_proxy_config_id = proxy_config_id;
     return action;
@@ -743,11 +743,11 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
     {
         PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
         if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
-            return RULE_ACTION_DIRECT;  // No proxy configured
+            return RULE_ACTION_BLOCK;  // Fail closed: never leak a PROXY rule to direct
 
         // UDP: HTTP proxy doesn't support UDP - use per-rule proxy config type
         if (is_udp && cfg->type == PROXY_TYPE_HTTP)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;
     }
 
     if (out_proxy_config_id != NULL)
@@ -1170,4 +1170,3 @@ void update_has_active_rules(void)
         flush_dns_resolver_cache();
     g_has_domain_rules = has_domain;
 }
-
