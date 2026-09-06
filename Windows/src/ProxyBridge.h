@@ -60,6 +60,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_na
 PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_position);  // Move rule to specific position (1=first, 2=second, etc)
 PROXYBRIDGE_API UINT32 ProxyBridge_GetRulePosition(UINT32 rule_id);  // Get current position of rule in list (1-based)
 PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable);
+// Controls whether PROXY rules include that process's own UDP/53 traffic. Enabling it
+// also covers TCP-only PROXY rules; disabling it excludes DNS from UDP/BOTH PROXY rules.
+// Other UDP traffic and DIRECT/BLOCK rules keep their protocol semantics.
+PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable);
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetConnectionCallback(ConnectionCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable);

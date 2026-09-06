@@ -532,9 +532,20 @@ RuleAction match_rule_inner(const char *process_name, UINT32 dest_ip, UINT16 des
             continue;
         }
 
+        // The caller explicitly controls whether PROXY rules include an application's
+        // own UDP DNS. Disabled means UDP/53 skips PROXY rules even for UDP/BOTH;
+        // enabled also lets a TCP-only PROXY rule carry DNS without widening other UDP.
+        BOOL is_proxy_udp_dns = is_udp && dest_port == 53 &&
+                                rule->action == RULE_ACTION_PROXY;
+        if (is_proxy_udp_dns && !g_proxy_udp_dns_enabled)
+        {
+            rule = rule->next;
+            continue;
+        }
+
         // Check protocol compatibility
         // RULE_PROTOCOL_BOTH (0x03) matches both TCP and UDP
-        if (rule->protocol != RULE_PROTOCOL_BOTH)
+        if (!is_proxy_udp_dns && rule->protocol != RULE_PROTOCOL_BOTH)
         {
             if (rule->protocol == RULE_PROTOCOL_TCP && is_udp)
             {
@@ -646,7 +657,15 @@ RuleAction match_rule_v6_inner(const char *process_name, const UINT8 dest_ip6[16
             continue;
         }
 
-        if (rule->protocol != RULE_PROTOCOL_BOTH)
+        BOOL is_proxy_udp_dns = is_udp && dest_port == 53 &&
+                                rule->action == RULE_ACTION_PROXY;
+        if (is_proxy_udp_dns && !g_proxy_udp_dns_enabled)
+        {
+            rule = rule->next;
+            continue;
+        }
+
+        if (!is_proxy_udp_dns && rule->protocol != RULE_PROTOCOL_BOTH)
         {
             if (rule->protocol == RULE_PROTOCOL_TCP && is_udp) { rule = rule->next; continue; }
             if (rule->protocol == RULE_PROTOCOL_UDP && !is_udp) { rule = rule->next; continue; }

@@ -72,6 +72,7 @@ volatile LONG port_direct_bitmap[2048]  = {0};  // 8 KB
 
 UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
 BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
+volatile LONG g_proxy_udp_dns_enabled = FALSE;
 LogCallback g_log_callback = NULL;
 ConnectionCallback g_connection_callback = NULL;
 
@@ -881,6 +882,23 @@ PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable)
 {
     g_localhost_via_proxy = enable;
     log_message("Localhost routing: %s (most proxies block localhost for SSRF prevention)", enable ? "via proxy" : "direct");
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable)
+{
+    LONG next = enable ? TRUE : FALSE;
+    LONG previous = InterlockedExchange(&g_proxy_udp_dns_enabled, next);
+    if (previous != next)
+    {
+        // Decisions are cached by source port. Clear them so a runtime toggle takes
+        // effect for existing UDP sockets instead of waiting for their ports to change.
+        for (int i = 0; i < 2048; i++)
+        {
+            InterlockedExchange(&port_decided_bitmap[i], 0);
+            InterlockedExchange(&port_direct_bitmap[i], 0);
+        }
+    }
+    log_message("Proxy UDP DNS routing: %s", enable ? "enabled" : "disabled");
 }
 
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback)

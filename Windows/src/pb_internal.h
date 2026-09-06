@@ -206,6 +206,7 @@ extern volatile LONG port_decided_bitmap[2048];  // 8 KB
 extern volatile LONG port_direct_bitmap[2048];  // 8 KB
 extern UINT16 g_local_relay_port;
 extern BOOL g_localhost_via_proxy;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
+extern volatile LONG g_proxy_udp_dns_enabled;
 extern LogCallback g_log_callback;
 extern ConnectionCallback g_connection_callback;
 extern char  *g_pidtbl_buf;
