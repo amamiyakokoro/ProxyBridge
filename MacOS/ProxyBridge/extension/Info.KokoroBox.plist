@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>KokoroBox Application Routing</string>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>KokoroBox uses this extension to route only the applications you select.</string>
 	<key>NetworkExtension</key>
 	<dict>
 		<key>NEProviderClasses</key>
