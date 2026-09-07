@@ -288,6 +288,18 @@ private struct KokoroBoxConfiguration: Codable {
     let rules: [KokoroBoxRule]
 }
 
+private struct KokoroBoxPolicyEnvelope: Codable {
+    let version: Int
+    let revision: String
+    let configuration: KokoroBoxConfiguration
+}
+
+private struct KokoroBoxPolicyAcknowledgement: Codable {
+    let version: Int
+    let revision: String
+    let status: String
+}
+
 private enum KokoroBoxConfigurationError: LocalizedError {
     case invalid
 
@@ -297,6 +309,12 @@ private enum KokoroBoxConfigurationError: LocalizedError {
 }
 
 class AppProxyProvider: NETransparentProxyProvider {
+    private static let kokoroBoxAppGroup = "group.com.amamiyakokoro.app"
+    private static let kokoroBoxPolicyNotification =
+        "com.amamiyakokoro.app.routing-policy.changed" as CFString
+    private static let kokoroBoxPolicyFilename = "application-routing-policy.json"
+    private static let kokoroBoxPolicyAcknowledgementFilename =
+        "application-routing-policy-ack.json"
     
     // one log entry, kept as an enum so we don't allocate a dictionary per line,
     // the dict is only built when the gui drains a batch
@@ -414,6 +432,10 @@ class AppProxyProvider: NETransparentProxyProvider {
 
     private var kokoroBoxConfiguration: KokoroBoxConfiguration?
     private let kokoroBoxConfigurationLock = NSLock()
+    private let kokoroBoxPolicyQueue = DispatchQueue(
+        label: "com.amamiyakokoro.app.proxy-extension.policy"
+    )
+    private var kokoroBoxPolicyObserverInstalled = false
     private static let directSigningIdentifierPatterns = [
         "com.amamiyakokoro.app",
         "com.amamiyakokoro.app.*",
@@ -498,6 +520,70 @@ class AppProxyProvider: NETransparentProxyProvider {
         log("KokoroBox policy replaced atomically: \(configuration.rules.count) rule(s)")
     }
 
+    private static func kokoroBoxSharedURL(_ filename: String) -> URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: kokoroBoxAppGroup)?
+            .appendingPathComponent(filename, isDirectory: false)
+    }
+
+    private func installKokoroBoxPolicyObserver() {
+        guard !kokoroBoxPolicyObserverInstalled else { return }
+        kokoroBoxPolicyObserverInstalled = true
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            Unmanaged.passUnretained(self).toOpaque(),
+            { _, observer, _, _, _ in
+                guard let observer else { return }
+                let provider = Unmanaged<AppProxyProvider>
+                    .fromOpaque(observer)
+                    .takeUnretainedValue()
+                provider.kokoroBoxPolicyQueue.async {
+                    provider.loadSharedKokoroBoxPolicy()
+                }
+            },
+            Self.kokoroBoxPolicyNotification,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    private func removeKokoroBoxPolicyObserver() {
+        guard kokoroBoxPolicyObserverInstalled else { return }
+        CFNotificationCenterRemoveObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            Unmanaged.passUnretained(self).toOpaque(),
+            CFNotificationName(Self.kokoroBoxPolicyNotification),
+            nil
+        )
+        kokoroBoxPolicyObserverInstalled = false
+    }
+
+    private func loadSharedKokoroBoxPolicy() {
+        guard let policyURL = Self.kokoroBoxSharedURL(Self.kokoroBoxPolicyFilename),
+              let acknowledgementURL = Self.kokoroBoxSharedURL(
+                Self.kokoroBoxPolicyAcknowledgementFilename
+              ) else { return }
+        do {
+            let envelope = try JSONDecoder().decode(
+                KokoroBoxPolicyEnvelope.self,
+                from: Data(contentsOf: policyURL)
+            )
+            guard envelope.version == 1 else { throw KokoroBoxConfigurationError.invalid }
+            try installKokoroBoxConfiguration(JSONEncoder().encode(envelope.configuration))
+            let acknowledgement = KokoroBoxPolicyAcknowledgement(
+                version: 1,
+                revision: envelope.revision,
+                status: "ok"
+            )
+            try JSONEncoder().encode(acknowledgement).write(
+                to: acknowledgementURL,
+                options: .atomic
+            )
+        } catch {
+            log("KokoroBox shared policy update rejected", level: "ERROR")
+        }
+    }
+
     private func currentKokoroBoxConfiguration() -> KokoroBoxConfiguration? {
         kokoroBoxConfigurationLock.lock()
         defer { kokoroBoxConfigurationLock.unlock() }
@@ -569,6 +655,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
+        installKokoroBoxPolicyObserver()
         if let tunnelProtocol = protocolConfiguration as? NETunnelProviderProtocol,
            let data = tunnelProtocol.providerConfiguration?["kokoroBoxConfiguration"] as? Data {
             do {
@@ -600,6 +687,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     
     override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        removeKokoroBoxPolicyObserver()
         kokoroBoxConfigurationLock.lock()
         kokoroBoxConfiguration = nil
         kokoroBoxConfigurationLock.unlock()
