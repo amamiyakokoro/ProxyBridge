@@ -72,9 +72,7 @@ volatile LONG port_direct_bitmap[2048]  = {0};  // 8 KB
 
 UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
 BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
-volatile LONG g_dns_hijack_enabled = FALSE;
-volatile LONG g_dns_forward_workers = 0;
-UINT16 g_dns_hijack_port = 0;
+volatile LONG g_proxy_udp_dns_enabled = FALSE;
 LogCallback g_log_callback = NULL;
 ConnectionCallback g_connection_callback = NULL;
 
@@ -137,30 +135,18 @@ DWORD WINAPI packet_processor(LPVOID arg)
 
                     if (is_connection_tracked(sp, TRUE, TRUE))
                     {
-                        UINT8 tracked_dest6[16];
-                        UINT16 tracked_port6 = 0;
-                        UINT32 tracked_config6 = 0;
-                        get_connection_full_v6(sp, TRUE, tracked_dest6, &tracked_port6,
-                                               &tracked_config6);
-                        if (tracked_config6 == DNS_HIJACK_CONFIG_ID && !g_dns_hijack_enabled)
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                        static const UINT8 _lb6u2[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+                        BOOL both_lb=(memcmp(ipv6_header->SrcAddr,_lb6u2,16)==0&&memcmp(ipv6_header->DstAddr,_lb6u2,16)==0);
+                        if (!both_lb)
                         {
-                            remove_connection(sp, TRUE, TRUE);
+                            UINT32 tmp[4];
+                            memcpy(tmp,ipv6_header->DstAddr,16);
+                            memcpy(ipv6_header->DstAddr,ipv6_header->SrcAddr,16);
+                            memcpy(ipv6_header->SrcAddr,tmp,16);
+                            addr.Outbound = FALSE;
                         }
-                        else
-                        {
-                            udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-                            static const UINT8 _lb6u2[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
-                            BOOL both_lb=(memcmp(ipv6_header->SrcAddr,_lb6u2,16)==0&&memcmp(ipv6_header->DstAddr,_lb6u2,16)==0);
-                            if (!both_lb)
-                            {
-                                UINT32 tmp[4];
-                                memcpy(tmp,ipv6_header->DstAddr,16);
-                                memcpy(ipv6_header->DstAddr,ipv6_header->SrcAddr,16);
-                                memcpy(ipv6_header->SrcAddr,tmp,16);
-                                addr.Outbound = FALSE;
-                            }
-                            goto ipv6u_send;
-                        }
+                        goto ipv6u_send;
                     }
 
                     if (is_ipv6_multicast_or_linklocal((const UINT8*)ipv6_header->DstAddr))
@@ -179,7 +165,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     DWORD pid6u = 0;
                     UINT32 pcid6u = 0;
                     action6u = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, TRUE, &pid6u, &pcid6u);
-                    RuleAction dns_action6u = action6u;
 
                     if (action6u == RULE_ACTION_PROXY && !g_localhost_via_proxy)
                     {
@@ -193,12 +178,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     // Override PROXY to DIRECT for DHCPv6 ports (546=client, 547=server)
                     if (action6u == RULE_ACTION_PROXY && (dp == 546 || dp == 547))
                         action6u = RULE_ACTION_DIRECT;
-
-                    if (should_hijack_dns(pid6u, dns_action6u, dp))
-                    {
-                        action6u = RULE_ACTION_PROXY;
-                        pcid6u = DNS_HIJACK_CONFIG_ID;
-                    }
 
                     if (g_connection_callback != NULL && pid6u > 0)
                     {
@@ -231,8 +210,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     if (action6u == RULE_ACTION_PROXY)
                     {
                         PROXY_CONFIG *pc6u = find_proxy_config(pcid6u);
-                        if (pcid6u != DNS_HIJACK_CONFIG_ID &&
-                            (pc6u == NULL || pc6u->type != PROXY_TYPE_SOCKS5))
+                        if (pc6u == NULL || pc6u->type != PROXY_TYPE_SOCKS5)
                         {
                             // HTTP proxy can't relay UDP - drop
                             continue;
@@ -371,7 +349,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 DWORD pid6 = 0;
                 UINT32 proxy_config_id6 = 0;
                 action6 = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, FALSE, &pid6, &proxy_config_id6);
-                RuleAction dns_action6 = action6;
 
                 // ::1 IPv6 loopback - use  same "Localhost via Proxy" toggle as IPv4 127.
                 if (action6 == RULE_ACTION_PROXY && !g_localhost_via_proxy)
@@ -384,12 +361,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     BOOL is_v4mapped_lb = (!is_lb6 && memcmp(dst6, v4mapped_pfx, 12) == 0 && dst6[12] == 127);
                     if (is_lb6 || is_v4mapped_lb)
                         action6 = RULE_ACTION_DIRECT;
-                }
-
-                if (should_hijack_dns(pid6, dns_action6, dp))
-                {
-                    action6 = RULE_ACTION_PROXY;
-                    proxy_config_id6 = DNS_HIJACK_CONFIG_ID;
                 }
 
                 if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid6 > 0)
@@ -518,32 +489,20 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 else if (is_connection_tracked(ntohs(udp_header->SrcPort), TRUE, FALSE))
                 {
                     UINT16 src_port = ntohs(udp_header->SrcPort);
-                    UINT32 tracked_dest = 0;
-                    UINT16 tracked_port = 0;
-                    UINT32 tracked_config = 0;
-                    get_connection_full(src_port, TRUE, &tracked_dest, &tracked_port,
-                                        &tracked_config);
-                    if (tracked_config == DNS_HIJACK_CONFIG_ID && !g_dns_hijack_enabled)
+                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+
+                    BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
+                    BOOL src_is_loopback = (src_first_octet == 127);
+                    if (src_is_loopback)
                     {
-                        remove_connection(src_port, TRUE, FALSE);
+                        ip_header->DstAddr = htonl(INADDR_LOOPBACK);
                     }
                     else
                     {
-                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-
-                        BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
-                        BOOL src_is_loopback = (src_first_octet == 127);
-                        if (src_is_loopback)
-                        {
-                            ip_header->DstAddr = htonl(INADDR_LOOPBACK);
-                        }
-                        else
-                        {
-                            UINT32 temp_addr = ip_header->DstAddr;
-                            ip_header->DstAddr = ip_header->SrcAddr;
-                            ip_header->SrcAddr = temp_addr;
-                            addr.Outbound = FALSE;
-                        }
+                        UINT32 temp_addr = ip_header->DstAddr;
+                        ip_header->DstAddr = ip_header->SrcAddr;
+                        ip_header->SrcAddr = temp_addr;
+                        addr.Outbound = FALSE;
                     }
                 }
                 else
@@ -566,7 +525,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     UINT32 proxy_config_id = 0;
 
                     action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid, &proxy_config_id);
-                    RuleAction dns_action = action;
 
                     // override PROXY to DIRECT if localhost proxy is disabled and destination is localhost
                     BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
@@ -580,12 +538,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     // Override PROXY to DIRECT for DHCP ports (67=server, 68=client)
                     if (action == RULE_ACTION_PROXY && (dest_port == 67 || dest_port == 68))
                         action = RULE_ACTION_DIRECT;
-
-                    if (should_hijack_dns(pid, dns_action, dest_port))
-                    {
-                        action = RULE_ACTION_PROXY;
-                        proxy_config_id = DNS_HIJACK_CONFIG_ID;
-                    }
 
                     // only log if callback is set
                     // reuse pid from check_process_rule
@@ -803,7 +755,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 UINT32 proxy_config_id = 0;
 
                 action = check_process_rule(src_ip, src_port, orig_dest_ip, orig_dest_port, FALSE, &pid, &proxy_config_id);
-                RuleAction dns_action = action;
 
                 BYTE orig_dest_first_octet = (orig_dest_ip >> 0) & 0xFF;
                 if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && orig_dest_first_octet == 127)
@@ -812,12 +763,6 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 // Override PROXY to DIRECT for criticl ips
                 if (action == RULE_ACTION_PROXY && is_broadcast_or_multicast(orig_dest_ip))
                     action = RULE_ACTION_DIRECT;
-
-                if (should_hijack_dns(pid, dns_action, orig_dest_port))
-                {
-                    action = RULE_ACTION_PROXY;
-                    proxy_config_id = DNS_HIJACK_CONFIG_ID;
-                }
 
                 // only new TCP/SYN inital fist packet
                 if (g_connection_callback != NULL && tcp_header->Syn && !tcp_header->Ack && pid > 0)
@@ -939,18 +884,10 @@ PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable)
     log_message("Localhost routing: %s (most proxies block localhost for SSRF prevention)", enable ? "via proxy" : "direct");
 }
 
-PROXYBRIDGE_API BOOL ProxyBridge_ConfigureDnsHijack(BOOL enable, UINT16 local_dns_port)
+PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable)
 {
-    if (enable && (local_dns_port == 0 || local_dns_port == g_local_relay_port ||
-                   local_dns_port == LOCAL_UDP_RELAY_PORT))
-    {
-        log_message("DNS hijack rejected: invalid loopback DNS port %u", local_dns_port);
-        return FALSE;
-    }
-
     LONG next = enable ? TRUE : FALSE;
-    LONG previous = InterlockedExchange(&g_dns_hijack_enabled, next);
-    g_dns_hijack_port = enable ? local_dns_port : 0;
+    LONG previous = InterlockedExchange(&g_proxy_udp_dns_enabled, next);
     if (previous != next)
     {
         // Decisions are cached by source port. Clear them so a runtime toggle takes
@@ -961,11 +898,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_ConfigureDnsHijack(BOOL enable, UINT16 local_dn
             InterlockedExchange(&port_direct_bitmap[i], 0);
         }
     }
-    if (enable)
-        log_message("DNS hijack: enabled on 127.0.0.1:%u", local_dns_port);
-    else
-        log_message("DNS hijack: disabled");
-    return TRUE;
+    log_message("Proxy UDP DNS routing: %s", enable ? "enabled" : "disabled");
 }
 
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback)

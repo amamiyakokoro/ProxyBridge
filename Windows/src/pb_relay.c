@@ -169,18 +169,6 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 if (get_connection(from_port, TRUE, &dest_ip, &dest_port))
                 {
                     UINT32 proxy_config_id = get_connection_proxy_id(from_port, TRUE);
-
-                    if (proxy_config_id == DNS_HIJACK_CONFIG_ID)
-                    {
-                        UINT32 client_ip = 0;
-                        UINT8 unused_ip6[16] = {0};
-                        if (!get_connection_client(from_port, FALSE, &client_ip, unused_ip6) ||
-                            !queue_dns_forward(recv_buf, recv_len, FALSE, client_ip,
-                                               unused_ip6, from_port))
-                            log_message("[DNS HIJACK] Failed to queue IPv4 query from port %u", from_port);
-                        continue;
-                    }
-
                     PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
 
                     if (cfg == NULL || cfg->type != PROXY_TYPE_SOCKS5)
@@ -371,17 +359,6 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
 
                 if (get_connection_full_v6(from_port, TRUE, dest_ip6, &dest_port, &proxy_config_id))
                 {
-                    if (proxy_config_id == DNS_HIJACK_CONFIG_ID)
-                    {
-                        UINT32 unused_ip = 0;
-                        UINT8 client_ip6[16] = {0};
-                        if (!get_connection_client(from_port, TRUE, &unused_ip, client_ip6) ||
-                            !queue_dns_forward(recv_buf, recv_len, TRUE, unused_ip,
-                                               client_ip6, from_port))
-                            log_message("[DNS HIJACK] Failed to queue IPv6 query from port %u", from_port);
-                        continue;
-                    }
-
                     PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
                     if (cfg != NULL && cfg->type == PROXY_TYPE_SOCKS5)
                     {
@@ -602,12 +579,9 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
     free(config);
 
-    BOOL dns_hijack = proxy_config_id == DNS_HIJACK_CONFIG_ID;
-
-    // Look up the proxy config for this connection. DNS-hijacked TCP/53 is relayed
-    // directly to Mihomo's loopback DNS listener instead of going through SOCKS.
-    PROXY_CONFIG *proxy = dns_hijack ? NULL : find_proxy_config(proxy_config_id);
-    if (!dns_hijack && (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0))
+    // Look up the proxy config for this connection
+    PROXY_CONFIG *proxy = find_proxy_config(proxy_config_id);
+    if (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0)
     {
         log_message("[RELAY] No proxy config (id=%u) - dropping connection", proxy_config_id);
         closesocket(client_sock);
@@ -615,8 +589,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
     }
 
     // Connect to proxy, use cached resolved IP to avoid DNS per connection
-    UINT32 proxy_ip = dns_hijack ? htonl(INADDR_LOOPBACK) :
-        (proxy->resolved_ip ? proxy->resolved_ip : resolve_hostname(proxy->host));
+    UINT32 proxy_ip = proxy->resolved_ip ? proxy->resolved_ip : resolve_hostname(proxy->host);
     if (proxy_ip == 0)
     {
         closesocket(client_sock);
@@ -643,21 +616,17 @@ DWORD WINAPI connection_handler(LPVOID arg)
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
     socks_addr.sin_addr.s_addr = proxy_ip;
-    socks_addr.sin_port = htons(dns_hijack ? g_dns_hijack_port : proxy->port);
+    socks_addr.sin_port = htons(proxy->port);
 
     if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
     {
-        if (dns_hijack)
-            log_message("[DNS HIJACK] Failed to connect to Mihomo DNS on 127.0.0.1:%u (%d)",
-                        g_dns_hijack_port, WSAGetLastError());
-        else
-            log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
+        log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
         closesocket(client_sock);
         closesocket(socks_sock);
         return 0;
     }
 
-    if (!dns_hijack && proxy->type == PROXY_TYPE_SOCKS5)
+    if (proxy->type == PROXY_TYPE_SOCKS5)
     {
         int rc;
         char cached_domain[256];
@@ -684,7 +653,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
             return 0;
         }
     }
-    else if (!dns_hijack && proxy->type == PROXY_TYPE_HTTP)
+    else if (proxy->type == PROXY_TYPE_HTTP)
     {
         int rc = is_ipv6
             ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
