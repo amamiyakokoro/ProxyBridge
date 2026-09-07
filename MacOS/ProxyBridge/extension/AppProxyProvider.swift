@@ -436,6 +436,8 @@ class AppProxyProvider: NETransparentProxyProvider {
         label: "com.amamiyakokoro.app.proxy-extension.policy"
     )
     private var kokoroBoxPolicyObserverInstalled = false
+    private var kokoroBoxPolicyTimer: DispatchSourceTimer?
+    private var lastKokoroBoxPolicyRevision: String?
     private static let directSigningIdentifierPatterns = [
         "com.amamiyakokoro.app",
         "com.amamiyakokoro.app.*",
@@ -545,10 +547,23 @@ class AppProxyProvider: NETransparentProxyProvider {
             nil,
             .deliverImmediately
         )
+        // Darwin notifications are only a latency optimization. They can be
+        // coalesced or missed while a Network Extension process is suspended,
+        // so poll the tiny App Group envelope as a reliable fallback.
+        let timer = DispatchSource.makeTimerSource(queue: kokoroBoxPolicyQueue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
+            self?.loadSharedKokoroBoxPolicy()
+        }
+        kokoroBoxPolicyTimer = timer
+        timer.resume()
     }
 
     private func removeKokoroBoxPolicyObserver() {
         guard kokoroBoxPolicyObserverInstalled else { return }
+        kokoroBoxPolicyTimer?.setEventHandler {}
+        kokoroBoxPolicyTimer?.cancel()
+        kokoroBoxPolicyTimer = nil
         CFNotificationCenterRemoveObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             Unmanaged.passUnretained(self).toOpaque(),
@@ -562,14 +577,21 @@ class AppProxyProvider: NETransparentProxyProvider {
         guard let policyURL = Self.kokoroBoxSharedURL(Self.kokoroBoxPolicyFilename),
               let acknowledgementURL = Self.kokoroBoxSharedURL(
                 Self.kokoroBoxPolicyAcknowledgementFilename
-              ) else { return }
+              ),
+              let policyData = try? Data(contentsOf: policyURL) else { return }
         do {
             let envelope = try JSONDecoder().decode(
                 KokoroBoxPolicyEnvelope.self,
-                from: Data(contentsOf: policyURL)
+                from: policyData
             )
             guard envelope.version == 1 else { throw KokoroBoxConfigurationError.invalid }
-            try installKokoroBoxConfiguration(JSONEncoder().encode(envelope.configuration))
+            if envelope.revision != lastKokoroBoxPolicyRevision {
+                try installKokoroBoxConfiguration(JSONEncoder().encode(envelope.configuration))
+                lastKokoroBoxPolicyRevision = envelope.revision
+            }
+            // Always restore the acknowledgement. The host deliberately
+            // removes it before announcing a revision and may retry the same
+            // envelope after a process suspension.
             let acknowledgement = KokoroBoxPolicyAcknowledgement(
                 version: 1,
                 revision: envelope.revision,
@@ -688,6 +710,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     
     override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         removeKokoroBoxPolicyObserver()
+        lastKokoroBoxPolicyRevision = nil
         kokoroBoxConfigurationLock.lock()
         kokoroBoxConfiguration = nil
         kokoroBoxConfigurationLock.unlock()
