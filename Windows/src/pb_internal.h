@@ -23,6 +23,8 @@
 #define MAXBUF 0xFFFF
 #define LOCAL_PROXY_PORT 34010
 #define LOCAL_UDP_RELAY_PORT 34011  // its running UDP port still make sure to not run on same port as TCP, opening same port and tcp and udp cause issue and handling port at relay server response injection
+#define DNS_HIJACK_CONFIG_ID 0xFFFFFFFFu
+#define MAX_DNS_FORWARD_WORKERS 64
 #define MAX_PROCESS_NAME 65536
 #define VERSION "4.0.13-Beta"
 #define PID_CACHE_SIZE 1024
@@ -124,6 +126,15 @@ typedef struct {
     SOCKET to_socket;
 } TRANSFER_CONFIG;
 
+typedef struct {
+    UINT8 *payload;
+    int payload_len;
+    BOOL is_ipv6;
+    UINT32 client_ip;
+    UINT8 client_ip6[16];
+    UINT16 client_port;
+} DNS_FORWARD_REQUEST;
+
 // Two-thread bidirectional relay: each direction runs in its own thread so
 // a slow proxy (upload) never stalls the download pipe and vice-versa.
 typedef struct {
@@ -206,7 +217,9 @@ extern volatile LONG port_decided_bitmap[2048];  // 8 KB
 extern volatile LONG port_direct_bitmap[2048];  // 8 KB
 extern UINT16 g_local_relay_port;
 extern BOOL g_localhost_via_proxy;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
-extern volatile LONG g_proxy_udp_dns_enabled;
+extern volatile LONG g_dns_hijack_enabled;
+extern volatile LONG g_dns_forward_workers;
+extern UINT16 g_dns_hijack_port;
 extern LogCallback g_log_callback;
 extern ConnectionCallback g_connection_callback;
 extern char  *g_pidtbl_buf;
@@ -310,6 +323,10 @@ BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int d
 void snoop_dns_response(const UINT8 *payload, int payload_len);
 void cleanup_stale_dns_cache(void);
 void flush_dns_resolver_cache(void);
+BOOL should_hijack_dns(DWORD pid, RuleAction action, UINT16 dest_port);
+BOOL queue_dns_forward(const UINT8 *payload, int payload_len, BOOL is_ipv6,
+                       UINT32 client_ip, const UINT8 client_ip6[16], UINT16 client_port);
+DWORD WINAPI dns_forward_worker(LPVOID arg);
 
 // ---- pb_socks5.c ----
 int socks5_read_connect_reply(SOCKET s, int *reply);
@@ -335,6 +352,7 @@ BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UI
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
 BOOL get_connection(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port);
 BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id);
+BOOL get_connection_client(UINT16 src_port, BOOL is_ipv6, UINT32 *client_ip, UINT8 client_ip6[16]);
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp);
 void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
 void cleanup_stale_connections(void);

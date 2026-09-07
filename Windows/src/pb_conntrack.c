@@ -247,6 +247,33 @@ BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *
     return found;
 }
 
+BOOL get_connection_client(UINT16 src_port, BOOL is_ipv6, UINT32 *client_ip, UINT8 client_ip6[16])
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port && conn->is_udp && conn->is_ipv6 == is_ipv6)
+        {
+            if (is_ipv6)
+                memcpy(client_ip6, conn->src_ip6, 16);
+            else if (client_ip != NULL)
+                *client_ip = conn->src_ip;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity,
+                                  (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp)
 {
     UINT32 proxy_config_id = 0;
