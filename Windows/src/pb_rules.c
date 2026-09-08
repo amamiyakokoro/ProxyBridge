@@ -2,6 +2,36 @@
 
 // Rules: IP/port/domain/process matching and the rule-management API.
 
+static DWORD resolve_process_owner_v4(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+{
+    for (int attempt = 0; attempt < PID_LOOKUP_RETRY_ATTEMPTS; attempt++)
+    {
+        DWORD pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port)
+                           : get_process_id_from_connection(src_ip, src_port);
+        if (pid == 0 && is_udp)
+            pid = get_process_id_from_connection(src_ip, src_port);
+        if (pid != 0)
+            return pid;
+        if (attempt + 1 < PID_LOOKUP_RETRY_ATTEMPTS)
+            Sleep(PID_LOOKUP_RETRY_DELAY_MS);
+    }
+    return 0;
+}
+
+static DWORD resolve_process_owner_v6(const UINT8 src_ip6[16], UINT16 src_port, BOOL is_udp)
+{
+    for (int attempt = 0; attempt < PID_LOOKUP_RETRY_ATTEMPTS; attempt++)
+    {
+        DWORD pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
+                           : get_process_id_from_connection_v6(src_ip6, src_port);
+        if (pid != 0)
+            return pid;
+        if (attempt + 1 < PID_LOOKUP_RETRY_ATTEMPTS)
+            Sleep(PID_LOOKUP_RETRY_DELAY_MS);
+    }
+    return 0;
+}
+
 BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16])
 {
     // Multicast: FF00::/8  (IPv6 has no broadcast; multicast replaces it)
@@ -23,10 +53,16 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
 
-    pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
-                 : get_process_id_from_connection_v6(src_ip6, src_port);
+    pid = resolve_process_owner_v6(src_ip6, src_port, is_udp);
     if (out_pid) *out_pid = pid;
-    if (pid == 0) return RULE_ACTION_DIRECT;
+    if (pid == 0)
+    {
+        char dest_ip[64] = "unknown";
+        inet_ntop(AF_INET6, dest_ip6, dest_ip, sizeof(dest_ip));
+        log_message("[PID] Owner unresolved after retry: %s source-port=%u destination=[%s]:%u",
+                    is_udp ? "UDP" : "TCP", src_port, dest_ip, dest_port);
+        return RULE_ACTION_DIRECT;
+    }
     if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
         return RULE_ACTION_DIRECT;
@@ -735,16 +771,18 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
 
-    pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port) : get_process_id_from_connection(src_ip, src_port);
-    if (pid == 0 && is_udp)
-        pid = get_process_id_from_connection(src_ip, src_port);
-
-        // this may cause issues - need to find alternative
+    pid = resolve_process_owner_v4(src_ip, src_port, is_udp);
     if (out_pid != NULL)
         *out_pid = pid;
 
     if (pid == 0)
+    {
+        log_message("[PID] Owner unresolved after retry: %s source-port=%u destination=%u.%u.%u.%u:%u",
+                    is_udp ? "UDP" : "TCP", src_port,
+                    (dest_ip >> 0) & 0xFF, (dest_ip >> 8) & 0xFF,
+                    (dest_ip >> 16) & 0xFF, (dest_ip >> 24) & 0xFF, dest_port);
         return RULE_ACTION_DIRECT;
+    }
 
     // Auto-exclude: Always bypass the process that loaded this DLL (prevents loops)
     if (pid == g_current_process_id)
