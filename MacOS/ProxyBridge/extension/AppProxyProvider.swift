@@ -284,6 +284,9 @@ private struct KokoroBoxConfiguration: Codable {
     let proxyAvailable: Bool
     let proxyHost: String
     let proxyPort: Int
+    let proxyUdpDns: Bool
+    let dnsHost: String
+    let dnsPort: Int
     let diagnosticLogging: Bool
     let rules: [KokoroBoxRule]
 }
@@ -494,6 +497,8 @@ class AppProxyProvider: NETransparentProxyProvider {
               configuration.failClosed,
               configuration.proxyHost == "127.0.0.1",
               configuration.proxyPort == 7891,
+              configuration.dnsHost == "127.0.0.1",
+              configuration.dnsPort == 7892,
               configuration.rules.count <= 256 else {
             throw KokoroBoxConfigurationError.invalid
         }
@@ -721,6 +726,7 @@ class AppProxyProvider: NETransparentProxyProvider {
         for a in all {
             a.controlConnection.cancel()
             a.udpSession.cancel()
+            a.dnsSession?.cancel()
         }
         completionHandler()
     }
@@ -731,15 +737,47 @@ class AppProxyProvider: NETransparentProxyProvider {
         let clientFlow: NEAppProxyUDPFlow
         let controlConnection: NWTCPConnection  // socks5 tcp control channel, keeps the association alive
         let udpSession: NWUDPSession            // relay channel to the socks server
+        let dnsSession: NWUDPSession?           // raw queries to Mihomo's DNS listener
         let displayName: String
         var loggedDestinations = Set<String>()  // dedupe connection logs, bounded
         var isTornDown = false
+        private let dnsLock = NSLock()
+        private var dnsEndpoints: [UInt16: [NWHostEndpoint]] = [:]
+        private var pendingDnsEndpointCount = 0
 
-        init(clientFlow: NEAppProxyUDPFlow, controlConnection: NWTCPConnection, udpSession: NWUDPSession, displayName: String) {
+        init(clientFlow: NEAppProxyUDPFlow, controlConnection: NWTCPConnection, udpSession: NWUDPSession, dnsSession: NWUDPSession?, displayName: String) {
             self.clientFlow = clientFlow
             self.controlConnection = controlConnection
             self.udpSession = udpSession
+            self.dnsSession = dnsSession
             self.displayName = displayName
+        }
+
+        func rememberDnsEndpoint(_ endpoint: NWHostEndpoint, transactionID: UInt16) {
+            dnsLock.lock()
+            if pendingDnsEndpointCount >= 512, let stale = dnsEndpoints.keys.first,
+               let removed = dnsEndpoints.removeValue(forKey: stale) {
+                pendingDnsEndpointCount -= removed.count
+            }
+            dnsEndpoints[transactionID, default: []].append(endpoint)
+            pendingDnsEndpointCount += 1
+            dnsLock.unlock()
+        }
+
+        func takeDnsEndpoint(transactionID: UInt16) -> NWHostEndpoint? {
+            dnsLock.lock()
+            defer { dnsLock.unlock() }
+            guard var endpoints = dnsEndpoints[transactionID], !endpoints.isEmpty else {
+                return nil
+            }
+            let endpoint = endpoints.removeFirst()
+            pendingDnsEndpointCount -= 1
+            if endpoints.isEmpty {
+                dnsEndpoints.removeValue(forKey: transactionID)
+            } else {
+                dnsEndpoints[transactionID] = endpoints
+            }
+            return endpoint
         }
     }
     private var udpAssociations: [NEAppProxyUDPFlow: UDPAssociation] = [:]
@@ -1247,8 +1285,24 @@ class AppProxyProvider: NETransparentProxyProvider {
     private func relayUDPThroughSOCKS5(clientFlow: NEAppProxyUDPFlow, relayHost: String, relayPort: UInt16, tcpConnection: NWTCPConnection, displayName: String) {
         let relayEndpoint = NWHostEndpoint(hostname: relayHost, port: String(relayPort))
         let udpSession = self.createUDPSession(to: relayEndpoint, from: nil)
+        let dnsSession: NWUDPSession?
+        if let configuration = currentKokoroBoxConfiguration(), configuration.proxyUdpDns {
+            let dnsEndpoint = NWHostEndpoint(
+                hostname: configuration.dnsHost,
+                port: String(configuration.dnsPort)
+            )
+            dnsSession = self.createUDPSession(to: dnsEndpoint, from: nil)
+        } else {
+            dnsSession = nil
+        }
 
-        let association = UDPAssociation(clientFlow: clientFlow, controlConnection: tcpConnection, udpSession: udpSession, displayName: displayName)
+        let association = UDPAssociation(
+            clientFlow: clientFlow,
+            controlConnection: tcpConnection,
+            udpSession: udpSession,
+            dnsSession: dnsSession,
+            displayName: displayName
+        )
 
         udpLock.lock()
         let existing = udpAssociations[clientFlow]
@@ -1257,9 +1311,13 @@ class AppProxyProvider: NETransparentProxyProvider {
         // if the app reused a flow, drop the stale association first
         existing?.controlConnection.cancel()
         existing?.udpSession.cancel()
+        existing?.dnsSession?.cancel()
 
         readAndForwardClientUDP(association)
         readAndForwardRelayUDP(association)
+        if association.dnsSession != nil {
+            readAndForwardDnsUDP(association)
+        }
         // note: we deliberately don't read the control connection to detect close.
         // holding a strong ref keeps the associate alive, and reading it risks a
         // spurious teardown that would EPIPE the app's udp socket.
@@ -1277,6 +1335,7 @@ class AppProxyProvider: NETransparentProxyProvider {
 
         assoc.controlConnection.cancel()
         assoc.udpSession.cancel()
+        assoc.dnsSession?.cancel()
         flow.closeReadWithError(nil)
         flow.closeWriteWithError(nil)
     }
@@ -1302,12 +1361,31 @@ class AppProxyProvider: NETransparentProxyProvider {
 
             var toSend: [Data] = []
             toSend.reserveCapacity(datagrams.count)
+            var dnsToSend: [Data] = []
+            dnsToSend.reserveCapacity(datagrams.count)
 
             for i in 0..<min(datagrams.count, endpoints.count) {
                 guard let nwHost = endpoints[i] as? NWHostEndpoint else { continue }
                 let destHost = nwHost.hostname
                 let destPort = UInt16(nwHost.port) ?? 0
                 guard destPort != 0 else { continue }
+
+                if destPort == 53, association.dnsSession != nil {
+                    guard let transactionID = self.dnsTransactionID(datagrams[i]) else {
+                        self.log("Dropping malformed DNS datagram", level: "ERROR")
+                        continue
+                    }
+                    association.rememberDnsEndpoint(nwHost, transactionID: transactionID)
+                    dnsToSend.append(datagrams[i])
+                    let dnsLogKey = "dns:\(destHost)"
+                    if !association.loggedDestinations.contains(dnsLogKey) {
+                        if association.loggedDestinations.count < 64 {
+                            association.loggedDestinations.insert(dnsLogKey)
+                        }
+                        self.sendLogToApp(protocol: "UDP", process: association.displayName, destination: destHost, port: nwHost.port, proxy: "Mihomo DNS")
+                    }
+                    continue
+                }
 
                 // log each distinct destination once, cap the set so it can't grow forever
                 if !association.loggedDestinations.contains(destHost) {
@@ -1326,6 +1404,14 @@ class AppProxyProvider: NETransparentProxyProvider {
                 association.udpSession.writeMultipleDatagrams(toSend) { [weak self] error in
                     if let error = error {
                         self?.log("UDP write error: \(error.localizedDescription)", level: "ERROR")
+                    }
+                }
+            }
+
+            if !dnsToSend.isEmpty, let dnsSession = association.dnsSession {
+                dnsSession.writeMultipleDatagrams(dnsToSend) { [weak self] error in
+                    if let error = error {
+                        self?.log("Mihomo DNS write error: \(error.localizedDescription)", level: "ERROR")
                     }
                 }
             }
@@ -1368,6 +1454,43 @@ class AppProxyProvider: NETransparentProxyProvider {
                 }
             }
         }, maxDatagrams: 32)
+    }
+
+    private func readAndForwardDnsUDP(_ association: UDPAssociation) {
+        guard let dnsSession = association.dnsSession else { return }
+        dnsSession.setReadHandler({ [weak self] datagrams, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.log("Mihomo DNS relay error: \(error.localizedDescription)", level: "ERROR")
+                return
+            }
+            guard let datagrams = datagrams, !datagrams.isEmpty else { return }
+
+            var payloads: [Data] = []
+            var endpoints: [NWEndpoint] = []
+            for datagram in datagrams {
+                guard let transactionID = self.dnsTransactionID(datagram),
+                      let endpoint = association.takeDnsEndpoint(transactionID: transactionID) else {
+                    continue
+                }
+                payloads.append(datagram)
+                // Preserve the resolver endpoint requested by the application;
+                // Mihomo answered this packet on a dedicated loopback listener.
+                endpoints.append(endpoint)
+            }
+            if !payloads.isEmpty {
+                association.clientFlow.writeDatagrams(payloads, sentBy: endpoints) { [weak self] error in
+                    if let error = error {
+                        self?.log("Mihomo DNS response write error: \(error.localizedDescription)", level: "ERROR")
+                    }
+                }
+            }
+        }, maxDatagrams: 32)
+    }
+
+    private func dnsTransactionID(_ datagram: Data) -> UInt16? {
+        guard datagram.count >= 2 else { return nil }
+        return (UInt16(datagram[0]) << 8) | UInt16(datagram[1])
     }
     
     private func encapsulateSOCKS5UDP(datagram: Data, destHost: String, destPort: UInt16) -> Data? {
