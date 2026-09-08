@@ -27,6 +27,11 @@
 #define VERSION "4.0.13-Beta"
 #define PID_CACHE_SIZE 1024
 #define PID_CACHE_TTL_MS 30000
+// The first outbound packet can reach the WinDivert network layer before the
+// corresponding owner row is visible through GetExtendedTcpTable. A short,
+// bounded retry closes that race without delaying the normal cached path.
+#define PID_LOOKUP_RETRY_ATTEMPTS 4
+#define PID_LOOKUP_RETRY_DELAY_MS 2
 // Single packet-processor thread eliminates TCP packet reordering.
 // With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
 // can re-inject its segment before thread N injects segment N, causing the

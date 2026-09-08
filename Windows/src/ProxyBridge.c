@@ -278,6 +278,11 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 UINT16 sp = ntohs(tcp_header->SrcPort);
                 UINT16 dp = ntohs(tcp_header->DstPort);
 
+                // A fresh SYN can reuse a port whose previous connection ended
+                // without a captured FIN/RST. Never inherit that stale decision.
+                if (tcp_header->Syn && !tcp_header->Ack)
+                    port_clear(sp);
+
                 if (port_is_decided(sp))
                 {
                     if (tcp_header->Fin || tcp_header->Rst) port_clear(sp);
@@ -406,7 +411,10 @@ DWORD WINAPI packet_processor(LPVOID arg)
 
                 if (action6 == RULE_ACTION_DIRECT)
                 {
-                    port_set_direct(sp);
+                    // PID lookup failure is not a real DIRECT decision. Leaving it
+                    // uncached allows the following packet to retry owner resolution.
+                    if (pid6 != 0)
+                        port_set_direct(sp);
                     WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                     continue;
                 }
@@ -670,7 +678,10 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 // process instead of a stale one (prevents wrong-app rule matching for
                 // up to PID_CACHE_TTL_MS after a port is recycled).
                 if (tcp_header->Syn && !tcp_header->Ack)
+                {
                     remove_cached_pid(ip_header->SrcAddr, sp, FALSE);
+                    port_clear(sp);
+                }
 
                 if (port_is_decided(sp))
                 {
@@ -812,7 +823,8 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     // Cache this decision so all subsequent packets from this port
                     // fast-path at the top of the outbound branch (zero kernel calls).
-                    port_set_direct(src_port);
+                    if (pid != 0)
+                        port_set_direct(src_port);
                     // Unmodified packet no checksum needed
                     WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                     continue;
