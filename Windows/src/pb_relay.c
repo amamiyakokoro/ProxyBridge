@@ -705,11 +705,10 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
 // One-directional relay: reads from `from` and writes to `to`.
 // Runs as a dedicated thread so upload and download never block each other.
-// Uses a shared RELAY_PAIR reference count for safe socket cleanup:
-//   - whichever direction finishes first calls shutdown() on both sockets,
-//     which causes the sibling thread's recv() to return 0 and exit cleanly.
-//   - the last thread to exit (refs drops to 0) closes both sockets and
-//     frees the shared RELAY_PAIR.
+// Uses a shared RELAY_PAIR reference count for safe socket cleanup. A clean EOF
+// is propagated as a half-close to the peer while the reverse direction keeps
+// running. I/O errors still abort both directions. The last thread to exit
+// closes both sockets and frees the shared RELAY_PAIR.
 DWORD WINAPI one_way_relay(LPVOID arg)
 {
     ONE_WAY_CONFIG *cfg = (ONE_WAY_CONFIG *)arg;
@@ -718,6 +717,7 @@ DWORD WINAPI one_way_relay(LPVOID arg)
     SOCKET to   = cfg->to;
     free(cfg);
 
+    BOOL clean_eof = FALSE;
     char *buf = (char *)malloc(131072);  // 128 KB per-direction buffer
     if (buf)
     {
@@ -727,14 +727,24 @@ DWORD WINAPI one_way_relay(LPVOID arg)
             if (send_all(to, buf, len) == SOCKET_ERROR)
                 break;
         }
+        clean_eof = (len == 0);
         free(buf);
     }
 
-    // Signal the sibling relay to stop by shutting down both sockets.
-    // shutdown() is safe to call from any thread; it just drains/resets the
-    // socket without closing the handle, so the other thread's recv() returns 0.
-    shutdown(pair->sock_client, SD_BOTH);
-    shutdown(pair->sock_proxy,  SD_BOTH);
+    if (clean_eof)
+    {
+        // `from` has no more bytes, but the reverse direction may still have a
+        // response to deliver. Propagate FIN only after all buffered bytes were
+        // synchronously sent by send_all().
+        shutdown(to, SD_SEND);
+    }
+    else
+    {
+        // Allocation, recv, or send failure: the stream is no longer reliable,
+        // so wake the sibling and abort the whole relay.
+        shutdown(pair->sock_client, SD_BOTH);
+        shutdown(pair->sock_proxy,  SD_BOTH);
+    }
 
     // Last thread out closes and frees everything.
     if (InterlockedDecrement(&pair->refs) == 0)

@@ -33,8 +33,6 @@ static DWORD resolve_process_owner_v4(UINT32 src_ip, UINT16 src_port,
         if (pid == 0)
             pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port)
                          : get_process_id_from_connection(src_ip, src_port);
-        if (pid == 0 && is_udp)
-            pid = get_process_id_from_connection(src_ip, src_port);
         if (pid != 0)
             return pid;
 
