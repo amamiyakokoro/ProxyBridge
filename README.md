@@ -1,9 +1,9 @@
 # ProxyBridge for KokoroBox
 
-This maintained fork supplies the application-routing components used by
-[KokoroBox Desktop](https://github.com/amamiyakokoro/KokoroBox-Desktop).
-It is not a standalone ProxyBridge distribution; upstream documentation and
-the preserved upstream README are available from
+This independently maintained repository supplies the application-routing
+components used by [KokoroBox Desktop](https://github.com/amamiyakokoro/KokoroBox-Desktop).
+It is not a standalone ProxyBridge distribution. Documentation for the
+original ProxyBridge project and its preserved README are available from
 [InterceptSuite/ProxyBridge](https://github.com/InterceptSuite/ProxyBridge)
 and [README.upstream.md](README.upstream.md).
 
