@@ -363,3 +363,160 @@ void cleanup_stale_pid_cache(void)
     ReleaseSRWLockExclusive(&lock);
 }
 
+static UINT32 owner_cache_hash(const UINT8 local_addr[16], UINT16 local_port, BOOL is_udp)
+{
+    (void)local_addr;
+    UINT32 hash = ((UINT32)local_port << 16) ^ (is_udp ? 0x9E3779B9u : 0x85EBCA6Bu);
+    return hash % OWNER_CACHE_SIZE;
+}
+
+static BOOL address_is_unspecified(const UINT8 addr[16])
+{
+    static const UINT8 zero[16] = {0};
+    return memcmp(addr, zero, sizeof(zero)) == 0;
+}
+
+DWORD get_owner_event_pid(const UINT8 local_addr[16], UINT16 local_port,
+                          const UINT8 remote_addr[16], UINT16 remote_port, BOOL is_udp)
+{
+    UINT32 hash = owner_cache_hash(local_addr, local_port, is_udp);
+    ULONGLONG now = GetTickCount64();
+    DWORD pid = 0;
+    int best_score = -1;
+
+    AcquireSRWLockShared(&lock);
+    for (OWNER_CACHE_ENTRY *entry = owner_cache[hash]; entry != NULL; entry = entry->next)
+    {
+        if (entry->local_port != local_port || entry->is_udp != is_udp ||
+            now - entry->timestamp >= OWNER_CACHE_TTL_MS)
+            continue;
+
+        BOOL local_exact = memcmp(entry->local_addr, local_addr, 16) == 0;
+        BOOL local_wildcard = address_is_unspecified(entry->local_addr);
+        if (!local_exact && !local_wildcard)
+            continue;
+
+        BOOL remote_exact = entry->remote_port == remote_port &&
+                            memcmp(entry->remote_addr, remote_addr, 16) == 0;
+        BOOL remote_wildcard = entry->remote_port == 0 &&
+                               address_is_unspecified(entry->remote_addr);
+        if (!remote_exact && !remote_wildcard)
+            continue;
+
+        int score = (local_exact ? 2 : 0) + (remote_exact ? 2 : 0);
+        if (score > best_score)
+        {
+            best_score = score;
+            pid = entry->pid;
+            if (score == 4)
+                break;
+        }
+    }
+    ReleaseSRWLockShared(&lock);
+    return pid;
+}
+
+void cache_owner_event(const UINT8 local_addr[16], UINT16 local_port,
+                       const UINT8 remote_addr[16], UINT16 remote_port, BOOL is_udp,
+                       DWORD pid, ULONGLONG endpoint_id, UINT8 source_layer)
+{
+    if (pid == 0 || local_port == 0)
+        return;
+
+    UINT32 hash = owner_cache_hash(local_addr, local_port, is_udp);
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&lock);
+    for (OWNER_CACHE_ENTRY *entry = owner_cache[hash]; entry != NULL; entry = entry->next)
+    {
+        if (entry->endpoint_id == endpoint_id && entry->source_layer == source_layer &&
+            entry->local_port == local_port && entry->remote_port == remote_port &&
+            entry->is_udp == is_udp && memcmp(entry->local_addr, local_addr, 16) == 0 &&
+            memcmp(entry->remote_addr, remote_addr, 16) == 0)
+        {
+            entry->pid = pid;
+            entry->timestamp = now;
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+    }
+
+    OWNER_CACHE_ENTRY *entry = (OWNER_CACHE_ENTRY *)calloc(1, sizeof(*entry));
+    if (entry != NULL)
+    {
+        memcpy(entry->local_addr, local_addr, 16);
+        memcpy(entry->remote_addr, remote_addr, 16);
+        entry->local_port = local_port;
+        entry->remote_port = remote_port;
+        entry->pid = pid;
+        entry->endpoint_id = endpoint_id;
+        entry->timestamp = now;
+        entry->is_udp = is_udp;
+        entry->source_layer = source_layer;
+        entry->next = owner_cache[hash];
+        owner_cache[hash] = entry;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void remove_owner_event_endpoint(ULONGLONG endpoint_id, UINT8 source_layer)
+{
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < OWNER_CACHE_SIZE; i++)
+    {
+        OWNER_CACHE_ENTRY **cursor = &owner_cache[i];
+        while (*cursor != NULL)
+        {
+            if ((*cursor)->endpoint_id == endpoint_id && (*cursor)->source_layer == source_layer)
+            {
+                OWNER_CACHE_ENTRY *entry = *cursor;
+                *cursor = entry->next;
+                free(entry);
+            }
+            else
+            {
+                cursor = &(*cursor)->next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void clear_owner_event_cache(void)
+{
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < OWNER_CACHE_SIZE; i++)
+    {
+        while (owner_cache[i] != NULL)
+        {
+            OWNER_CACHE_ENTRY *entry = owner_cache[i];
+            owner_cache[i] = entry->next;
+            free(entry);
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void cleanup_stale_owner_cache(void)
+{
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < OWNER_CACHE_SIZE; i++)
+    {
+        OWNER_CACHE_ENTRY **cursor = &owner_cache[i];
+        while (*cursor != NULL)
+        {
+            if (now - (*cursor)->timestamp >= OWNER_CACHE_TTL_MS)
+            {
+                OWNER_CACHE_ENTRY *entry = *cursor;
+                *cursor = entry->next;
+                free(entry);
+            }
+            else
+            {
+                cursor = &(*cursor)->next;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+

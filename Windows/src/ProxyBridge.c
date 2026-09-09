@@ -25,11 +25,17 @@ SRWLOCK lock;
 // already in the valid unlocked state, so this is safe to use before ProxyBridge_Start.
 SRWLOCK g_rules_lock;
 HANDLE windivert_handle = INVALID_HANDLE_VALUE;
+HANDLE owner_socket_handle = INVALID_HANDLE_VALUE;
+HANDLE owner_flow_handle = INVALID_HANDLE_VALUE;
 HANDLE packet_thread[NUM_PACKET_THREADS] = {NULL};
+HANDLE owner_socket_thread = NULL;
+HANDLE owner_flow_thread = NULL;
+HANDLE owner_update_event = NULL;
 HANDLE proxy_thread = NULL;
 HANDLE udp_relay_thread = NULL;
 HANDLE cleanup_thread = NULL;
 PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE] = {NULL};
+OWNER_CACHE_ENTRY *owner_cache[OWNER_CACHE_SIZE] = {NULL};
 volatile BOOL g_has_active_rules = FALSE;
 // Set when at least one enabled rule carries a domain filter. Gates the DNS-cache
 // lookup in match_rule so setups without domain rules pay zero extra cost.
@@ -73,11 +79,162 @@ volatile LONG port_direct_bitmap[2048]  = {0};  // 8 KB
 UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
 BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 volatile LONG g_proxy_udp_dns_enabled = FALSE;
+volatile LONG g_fail_closed_on_unknown_owner = FALSE;
 LogCallback g_log_callback = NULL;
 ConnectionCallback g_connection_callback = NULL;
 
 char  *g_pidtbl_buf = NULL;
 DWORD  g_pidtbl_cap = 0;
+
+static void owner_address_to_network_bytes(const UINT32 address[4], UINT8 output[16])
+{
+    UINT32 network_order[4];
+    WinDivertHelperHtonIPv6Address(address, network_order);
+    memcpy(output, network_order, 16);
+}
+
+DWORD WINAPI owner_event_processor(LPVOID arg)
+{
+    HANDLE handle = (HANDLE)arg;
+    WINDIVERT_ADDRESS addr;
+
+    while (running)
+    {
+        if (!WinDivertRecv(handle, NULL, 0, NULL, &addr))
+        {
+            DWORD error = GetLastError();
+            if (!running || error == ERROR_INVALID_HANDLE || error == ERROR_OPERATION_ABORTED)
+                break;
+            log_message("[OWNER] Failed to receive owner event (%lu)", error);
+            continue;
+        }
+
+        const UINT32 *local;
+        const UINT32 *remote;
+        UINT16 local_port;
+        UINT16 remote_port;
+        UINT8 protocol;
+        UINT32 pid;
+        ULONGLONG endpoint_id;
+        UINT8 source_layer = (UINT8)addr.Layer;
+        BOOL deleted;
+
+        if (addr.Layer == WINDIVERT_LAYER_SOCKET)
+        {
+            local = addr.Socket.LocalAddr;
+            remote = addr.Socket.RemoteAddr;
+            local_port = addr.Socket.LocalPort;
+            remote_port = addr.Socket.RemotePort;
+            protocol = addr.Socket.Protocol;
+            pid = addr.Socket.ProcessId;
+            endpoint_id = addr.Socket.EndpointId;
+            deleted = addr.Event == WINDIVERT_EVENT_SOCKET_CLOSE;
+        }
+        else if (addr.Layer == WINDIVERT_LAYER_FLOW)
+        {
+            local = addr.Flow.LocalAddr;
+            remote = addr.Flow.RemoteAddr;
+            local_port = addr.Flow.LocalPort;
+            remote_port = addr.Flow.RemotePort;
+            protocol = addr.Flow.Protocol;
+            pid = addr.Flow.ProcessId;
+            endpoint_id = addr.Flow.EndpointId;
+            deleted = addr.Event == WINDIVERT_EVENT_FLOW_DELETED;
+        }
+        else
+        {
+            continue;
+        }
+
+        if (deleted)
+        {
+            remove_owner_event_endpoint(endpoint_id, source_layer);
+            if (owner_update_event != NULL) SetEvent(owner_update_event);
+            continue;
+        }
+        if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+            continue;
+
+        UINT8 local_addr[16];
+        UINT8 remote_addr[16];
+        owner_address_to_network_bytes(local, local_addr);
+        owner_address_to_network_bytes(remote, remote_addr);
+        cache_owner_event(local_addr, local_port, remote_addr, remote_port,
+                          protocol == IPPROTO_UDP, pid, endpoint_id, source_layer);
+        if (owner_update_event != NULL) SetEvent(owner_update_event);
+    }
+    return 0;
+}
+
+static void stop_owner_observers(void)
+{
+    HANDLE handles[2] = {owner_socket_handle, owner_flow_handle};
+    for (int i = 0; i < 2; i++)
+    {
+        if (handles[i] != INVALID_HANDLE_VALUE)
+        {
+            WinDivertShutdown(handles[i], WINDIVERT_SHUTDOWN_BOTH);
+            WinDivertClose(handles[i]);
+        }
+    }
+    owner_socket_handle = INVALID_HANDLE_VALUE;
+    owner_flow_handle = INVALID_HANDLE_VALUE;
+
+    HANDLE *threads[2] = {&owner_socket_thread, &owner_flow_thread};
+    for (int i = 0; i < 2; i++)
+    {
+        if (*threads[i] != NULL)
+        {
+            WaitForSingleObject(*threads[i], 1000);
+            CloseHandle(*threads[i]);
+            *threads[i] = NULL;
+        }
+    }
+    if (owner_update_event != NULL)
+    {
+        CloseHandle(owner_update_event);
+        owner_update_event = NULL;
+    }
+}
+
+static BOOL start_owner_observers(INT16 priority)
+{
+    owner_update_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (owner_update_event == NULL)
+    {
+        log_message("[OWNER] Failed to create update event (%lu)", GetLastError());
+        return FALSE;
+    }
+
+    UINT64 flags = WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY;
+    owner_socket_handle = WinDivertOpen("true", WINDIVERT_LAYER_SOCKET, priority, flags);
+    if (owner_socket_handle == INVALID_HANDLE_VALUE)
+    {
+        log_message("[OWNER] Failed to open WinDivert SOCKET layer (%lu)", GetLastError());
+        stop_owner_observers();
+        return FALSE;
+    }
+    owner_flow_handle = WinDivertOpen("true", WINDIVERT_LAYER_FLOW, priority, flags);
+    if (owner_flow_handle == INVALID_HANDLE_VALUE)
+    {
+        log_message("[OWNER] Failed to open WinDivert FLOW layer (%lu)", GetLastError());
+        stop_owner_observers();
+        return FALSE;
+    }
+
+    owner_socket_thread = CreateThread(NULL, 0, owner_event_processor,
+                                       owner_socket_handle, 0, NULL);
+    owner_flow_thread = CreateThread(NULL, 0, owner_event_processor,
+                                     owner_flow_handle, 0, NULL);
+    if (owner_socket_thread == NULL || owner_flow_thread == NULL)
+    {
+        log_message("[OWNER] Failed to start owner event workers (%lu)", GetLastError());
+        stop_owner_observers();
+        return FALSE;
+    }
+    log_message("[OWNER] SOCKET/FLOW correlation active");
+    return TRUE;
+}
 
 DWORD WINAPI packet_processor(LPVOID arg)
 {
@@ -913,6 +1070,12 @@ PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable)
     log_message("Proxy UDP DNS routing: %s", enable ? "enabled" : "disabled");
 }
 
+PROXYBRIDGE_API void ProxyBridge_SetFailClosedOnUnknownOwner(BOOL enable)
+{
+    InterlockedExchange(&g_fail_closed_on_unknown_owner, enable ? TRUE : FALSE);
+    log_message("Unknown process owner policy: %s", enable ? "BLOCK" : "DIRECT");
+}
+
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback)
 {
     g_log_callback = callback;
@@ -948,6 +1111,7 @@ DWORD WINAPI cleanup_worker(LPVOID arg)
         {
             cleanup_stale_connections();
             cleanup_stale_pid_cache();
+            cleanup_stale_owner_cache();
             cleanup_stale_dns_cache();
         }
     }
@@ -972,10 +1136,17 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     running = TRUE;
 
+    if (!start_owner_observers(priority))
+    {
+        running = FALSE;
+        return FALSE;
+    }
+
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
     if (proxy_thread == NULL)
     {
         running = FALSE;
+        stop_owner_observers();
         return FALSE;
     }
 
@@ -984,6 +1155,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     if (cleanup_thread == NULL)
     {
         running = FALSE;
+        stop_owner_observers();
         WaitForSingleObject(proxy_thread, INFINITE);
         CloseHandle(proxy_thread);
         proxy_thread = NULL;
@@ -996,6 +1168,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         if (udp_relay_thread == NULL)
         {
             running = FALSE;
+            stop_owner_observers();
             WaitForSingleObject(cleanup_thread, INFINITE);
             CloseHandle(cleanup_thread);
             cleanup_thread = NULL;
@@ -1057,6 +1230,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
                 break;
         }
         running = FALSE;
+        stop_owner_observers();
         WaitForSingleObject(proxy_thread, INFINITE);
         CloseHandle(proxy_thread);
         proxy_thread = NULL;
@@ -1083,6 +1257,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         if (packet_thread[i] == NULL)
         {
             running = FALSE;
+            stop_owner_observers();
             for (int j = 0; j < i; j++)
             {
                 if (packet_thread[j] != NULL)
@@ -1146,6 +1321,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
         windivert_handle = INVALID_HANDLE_VALUE;
     }
 
+    stop_owner_observers();
+
     // process alll packets before we stop, make sure packets are not dropped
     for (int i = 0; i < NUM_PACKET_THREADS; i++)
     {
@@ -1197,6 +1374,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     clear_logged_connections();
 
     clear_pid_cache();
+    clear_owner_event_cache();
 
     // Release the reusable owner-PID table scratch buffer (packet thread has stopped).
     free(g_pidtbl_buf);

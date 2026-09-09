@@ -64,6 +64,10 @@ PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable);
 // also covers TCP-only PROXY rules; disabling it excludes DNS from UDP/BOTH PROXY rules.
 // Other UDP traffic and DIRECT/BLOCK rules keep their protocol semantics.
 PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable);
+// When enabled, packets whose owning process cannot be resolved are blocked instead
+// of being sent directly. This is intended for managed per-application routing where
+// leaking an unclassified first packet is worse than retrying the connection.
+PROXYBRIDGE_API void ProxyBridge_SetFailClosedOnUnknownOwner(BOOL enable);
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetConnectionCallback(ConnectionCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable);
