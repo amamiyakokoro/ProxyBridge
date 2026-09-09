@@ -27,11 +27,12 @@
 #define VERSION "4.0.13-Beta"
 #define PID_CACHE_SIZE 1024
 #define PID_CACHE_TTL_MS 30000
-// The first outbound packet can reach the WinDivert network layer before the
-// corresponding owner row is visible through GetExtendedTcpTable. A short,
-// bounded retry closes that race without delaying the normal cached path.
-#define PID_LOOKUP_RETRY_ATTEMPTS 4
-#define PID_LOOKUP_RETRY_DELAY_MS 2
+// SOCKET/FLOW events normally identify the owner before the first NETWORK packet.
+// Keep a bounded wait as a fallback for event-thread scheduling and TCP-table lag.
+#define OWNER_LOOKUP_TIMEOUT_MS 100
+#define OWNER_LOOKUP_WAIT_SLICE_MS 10
+#define OWNER_CACHE_SIZE 2048
+#define OWNER_CACHE_TTL_MS 120000
 // Single packet-processor thread eliminates TCP packet reordering.
 // With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
 // can re-inject its segment before thread N injects segment N, causing the
@@ -160,6 +161,19 @@ typedef struct PID_CACHE_ENTRY {
     struct PID_CACHE_ENTRY *next;
 } PID_CACHE_ENTRY;
 
+typedef struct OWNER_CACHE_ENTRY {
+    UINT8 local_addr[16];
+    UINT8 remote_addr[16];
+    UINT16 local_port;
+    UINT16 remote_port;
+    DWORD pid;
+    ULONGLONG endpoint_id;
+    ULONGLONG timestamp;
+    BOOL is_udp;
+    UINT8 source_layer;
+    struct OWNER_CACHE_ENTRY *next;
+} OWNER_CACHE_ENTRY;
+
 // Internal proxy configuration with per-config UDP SOCKS5 state
 typedef struct {
     UINT32 config_id;           // Unique ID (1-based), 0 = unused slot
@@ -192,11 +206,17 @@ extern UINT32 g_next_rule_id;
 extern SRWLOCK lock;
 extern SRWLOCK g_rules_lock;
 extern HANDLE windivert_handle;
+extern HANDLE owner_socket_handle;
+extern HANDLE owner_flow_handle;
 extern HANDLE packet_thread[NUM_PACKET_THREADS];
+extern HANDLE owner_socket_thread;
+extern HANDLE owner_flow_thread;
+extern HANDLE owner_update_event;
 extern HANDLE proxy_thread;
 extern HANDLE udp_relay_thread;
 extern HANDLE cleanup_thread;
 extern PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE];
+extern OWNER_CACHE_ENTRY *owner_cache[OWNER_CACHE_SIZE];
 extern volatile BOOL g_has_active_rules;
 extern volatile BOOL g_has_domain_rules;
 extern SOCKET udp_relay_socket;
@@ -212,6 +232,7 @@ extern volatile LONG port_direct_bitmap[2048];  // 8 KB
 extern UINT16 g_local_relay_port;
 extern BOOL g_localhost_via_proxy;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 extern volatile LONG g_proxy_udp_dns_enabled;
+extern volatile LONG g_fail_closed_on_unknown_owner;
 extern LogCallback g_log_callback;
 extern ConnectionCallback g_connection_callback;
 extern char  *g_pidtbl_buf;
@@ -270,6 +291,14 @@ void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp);
 void clear_pid_cache(void);
 void remove_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp);
 void cleanup_stale_pid_cache(void);
+DWORD get_owner_event_pid(const UINT8 local_addr[16], UINT16 local_port,
+                          const UINT8 remote_addr[16], UINT16 remote_port, BOOL is_udp);
+void cache_owner_event(const UINT8 local_addr[16], UINT16 local_port,
+                       const UINT8 remote_addr[16], UINT16 remote_port, BOOL is_udp,
+                       DWORD pid, ULONGLONG endpoint_id, UINT8 source_layer);
+void remove_owner_event_endpoint(ULONGLONG endpoint_id, UINT8 source_layer);
+void clear_owner_event_cache(void);
+void cleanup_stale_owner_cache(void);
 
 // ---- pb_rules.c ----
 BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16]);
@@ -356,6 +385,7 @@ DWORD WINAPI transfer_handler(LPVOID arg);
 
 // ---- ProxyBridge.c ----
 DWORD WINAPI packet_processor(LPVOID arg);
+DWORD WINAPI owner_event_processor(LPVOID arg);
 DWORD WINAPI cleanup_worker(LPVOID arg);
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 

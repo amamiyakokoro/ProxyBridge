@@ -2,32 +2,73 @@
 
 // Rules: IP/port/domain/process matching and the rule-management API.
 
-static DWORD resolve_process_owner_v4(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
+static void make_v4_mapped_address(UINT32 ip, UINT8 out[16])
 {
-    for (int attempt = 0; attempt < PID_LOOKUP_RETRY_ATTEMPTS; attempt++)
+    memset(out, 0, 16);
+    out[10] = 0xFF;
+    out[11] = 0xFF;
+    memcpy(out + 12, &ip, sizeof(ip));
+}
+
+static void wait_for_owner_update(DWORD milliseconds)
+{
+    if (owner_update_event != NULL)
+        WaitForSingleObject(owner_update_event, milliseconds);
+    else
+        Sleep(milliseconds);
+}
+
+static DWORD resolve_process_owner_v4(UINT32 src_ip, UINT16 src_port,
+                                      UINT32 dest_ip, UINT16 dest_port, BOOL is_udp)
+{
+    UINT8 local_addr[16];
+    UINT8 remote_addr[16];
+    ULONGLONG deadline = GetTickCount64() + OWNER_LOOKUP_TIMEOUT_MS;
+    make_v4_mapped_address(src_ip, local_addr);
+    make_v4_mapped_address(dest_ip, remote_addr);
+
+    for (;;)
     {
-        DWORD pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port)
-                           : get_process_id_from_connection(src_ip, src_port);
+        DWORD pid = get_owner_event_pid(local_addr, src_port, remote_addr, dest_port, is_udp);
+        if (pid == 0)
+            pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port)
+                         : get_process_id_from_connection(src_ip, src_port);
         if (pid == 0 && is_udp)
             pid = get_process_id_from_connection(src_ip, src_port);
         if (pid != 0)
             return pid;
-        if (attempt + 1 < PID_LOOKUP_RETRY_ATTEMPTS)
-            Sleep(PID_LOOKUP_RETRY_DELAY_MS);
+
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            break;
+        DWORD remaining = (DWORD)(deadline - now);
+        wait_for_owner_update(remaining < OWNER_LOOKUP_WAIT_SLICE_MS
+                                  ? remaining
+                                  : OWNER_LOOKUP_WAIT_SLICE_MS);
     }
     return 0;
 }
 
-static DWORD resolve_process_owner_v6(const UINT8 src_ip6[16], UINT16 src_port, BOOL is_udp)
+static DWORD resolve_process_owner_v6(const UINT8 src_ip6[16], UINT16 src_port,
+                                      const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp)
 {
-    for (int attempt = 0; attempt < PID_LOOKUP_RETRY_ATTEMPTS; attempt++)
+    ULONGLONG deadline = GetTickCount64() + OWNER_LOOKUP_TIMEOUT_MS;
+    for (;;)
     {
-        DWORD pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
-                           : get_process_id_from_connection_v6(src_ip6, src_port);
+        DWORD pid = get_owner_event_pid(src_ip6, src_port, dest_ip6, dest_port, is_udp);
+        if (pid == 0)
+            pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
+                         : get_process_id_from_connection_v6(src_ip6, src_port);
         if (pid != 0)
             return pid;
-        if (attempt + 1 < PID_LOOKUP_RETRY_ATTEMPTS)
-            Sleep(PID_LOOKUP_RETRY_DELAY_MS);
+
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            break;
+        DWORD remaining = (DWORD)(deadline - now);
+        wait_for_owner_update(remaining < OWNER_LOOKUP_WAIT_SLICE_MS
+                                  ? remaining
+                                  : OWNER_LOOKUP_WAIT_SLICE_MS);
     }
     return 0;
 }
@@ -53,7 +94,7 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
 
-    pid = resolve_process_owner_v6(src_ip6, src_port, is_udp);
+    pid = resolve_process_owner_v6(src_ip6, src_port, dest_ip6, dest_port, is_udp);
     if (out_pid) *out_pid = pid;
     if (pid == 0)
     {
@@ -61,11 +102,14 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
         inet_ntop(AF_INET6, dest_ip6, dest_ip, sizeof(dest_ip));
         log_message("[PID] Owner unresolved after retry: %s source-port=%u destination=[%s]:%u",
                     is_udp ? "UDP" : "TCP", src_port, dest_ip, dest_port);
-        return RULE_ACTION_DIRECT;
+        return g_fail_closed_on_unknown_owner ? RULE_ACTION_BLOCK : RULE_ACTION_DIRECT;
     }
     if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
-        return RULE_ACTION_DIRECT;
+    {
+        log_message("[PID] Process image unresolved: pid=%lu", pid);
+        return g_fail_closed_on_unknown_owner ? RULE_ACTION_BLOCK : RULE_ACTION_DIRECT;
+    }
 
     UINT32 proxy_config_id = 0;
     RuleAction action = match_rule_v6(process_name, dest_ip6, dest_port, is_udp, &proxy_config_id);
@@ -771,7 +815,7 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
 
-    pid = resolve_process_owner_v4(src_ip, src_port, is_udp);
+    pid = resolve_process_owner_v4(src_ip, src_port, dest_ip, dest_port, is_udp);
     if (out_pid != NULL)
         *out_pid = pid;
 
@@ -781,7 +825,7 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
                     is_udp ? "UDP" : "TCP", src_port,
                     (dest_ip >> 0) & 0xFF, (dest_ip >> 8) & 0xFF,
                     (dest_ip >> 16) & 0xFF, (dest_ip >> 24) & 0xFF, dest_port);
-        return RULE_ACTION_DIRECT;
+        return g_fail_closed_on_unknown_owner ? RULE_ACTION_BLOCK : RULE_ACTION_DIRECT;
     }
 
     // Auto-exclude: Always bypass the process that loaded this DLL (prevents loops)
@@ -789,7 +833,10 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
         return RULE_ACTION_DIRECT;
 
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name)))
-        return RULE_ACTION_DIRECT;
+    {
+        log_message("[PID] Process image unresolved: pid=%lu", pid);
+        return g_fail_closed_on_unknown_owner ? RULE_ACTION_BLOCK : RULE_ACTION_DIRECT;
+    }
 
     // Use unified rule matching function
     UINT32 proxy_config_id = 0;
