@@ -47,6 +47,6 @@ KokoroBox release pipeline.
 ## License and attribution
 
 ProxyBridge is licensed under the [MIT License](LICENSE). Copyright and
-attribution from the original project are retained. The Windows
+attribution from the original project is retained. The Windows
 implementation uses [WinDivert](https://reqrypt.org/windivert.html), whose
 license and redistribution requirements must also be preserved.

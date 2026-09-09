@@ -24,7 +24,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: manual
@@ -33,10 +33,11 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip -OutFile WinDivert.zip
+          if ((Get-FileHash WinDivert.zip -Algorithm SHA256).Hash -ne '63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15') { throw 'WinDivert archive hash mismatch' }
           Expand-Archive WinDivert.zip -DestinationPath C:\
           Windows\compile.ps1
       - name: Build macOS extension
         if: matrix.language == 'swift'
         run: |
           xcodebuild -project MacOS/ProxyBridge/ProxyBridge.xcodeproj -scheme extension -configuration Debug -derivedDataPath build/DerivedData -xcconfig MacOS/ProxyBridge/kokorobox-ext.xcconfig KOKOROBOX_TARGET_ARCH=arm64 CODE_SIGNING_ALLOWED=NO build
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
