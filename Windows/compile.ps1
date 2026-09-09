@@ -4,6 +4,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$OutputDirectory = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    $OutputDirectory
+} else {
+    Join-Path $PSScriptRoot $OutputDirectory
+}
 $SourceFiles = @(
     "src\ProxyBridge.c", "src\pb_util.c", "src\pb_process.c", "src\pb_rules.c",
     "src\pb_proxy.c", "src\pb_dns.c", "src\pb_socks5.c", "src\pb_http.c",
