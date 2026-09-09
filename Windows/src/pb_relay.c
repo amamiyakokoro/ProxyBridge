@@ -2,6 +2,92 @@
 
 // Relay: TCP/UDP relay servers and per-connection worker threads.
 
+static SRWLOCK relay_pairs_lock = SRWLOCK_INIT;
+static RELAY_PAIR *active_relay_pairs = NULL;
+
+static void publish_start_result(HANDLE event, volatile LONG *status, BOOL ready)
+{
+    InterlockedExchange(status, ready ? 1 : -1);
+    if (event != NULL)
+        SetEvent(event);
+}
+
+static BOOL begin_connection_worker(void)
+{
+    InterlockedIncrement(&active_connection_workers);
+    if (connection_workers_done_event != NULL)
+        ResetEvent(connection_workers_done_event);
+
+    // Increment before checking `running` so Stop cannot observe a signalled
+    // done-event while a listener is concurrently dispatching a worker.
+    if (!running)
+    {
+        if (InterlockedDecrement(&active_connection_workers) == 0 &&
+            connection_workers_done_event != NULL)
+            SetEvent(connection_workers_done_event);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void end_connection_worker(void)
+{
+    if (InterlockedDecrement(&active_connection_workers) == 0 &&
+        connection_workers_done_event != NULL)
+        SetEvent(connection_workers_done_event);
+}
+
+static BOOL register_relay_pair(RELAY_PAIR *pair)
+{
+    BOOL registered = FALSE;
+    AcquireSRWLockExclusive(&relay_pairs_lock);
+    if (shutdown_event == NULL || running)
+    {
+        pair->next = active_relay_pairs;
+        active_relay_pairs = pair;
+        pair->registered = TRUE;
+        registered = TRUE;
+    }
+    ReleaseSRWLockExclusive(&relay_pairs_lock);
+    return registered;
+}
+
+static void unregister_relay_pair(RELAY_PAIR *pair)
+{
+    AcquireSRWLockExclusive(&relay_pairs_lock);
+    if (pair->registered)
+    {
+        RELAY_PAIR **cursor = &active_relay_pairs;
+        while (*cursor != NULL)
+        {
+            if (*cursor == pair)
+            {
+                *cursor = pair->next;
+                break;
+            }
+            cursor = &(*cursor)->next;
+        }
+        pair->registered = FALSE;
+        pair->next = NULL;
+    }
+    ReleaseSRWLockExclusive(&relay_pairs_lock);
+}
+
+void abort_active_relays(void)
+{
+    int count = 0;
+    AcquireSRWLockShared(&relay_pairs_lock);
+    for (RELAY_PAIR *pair = active_relay_pairs; pair != NULL; pair = pair->next)
+    {
+        count++;
+        shutdown(pair->sock_client, SD_BOTH);
+        shutdown(pair->sock_proxy, SD_BOTH);
+    }
+    ReleaseSRWLockShared(&relay_pairs_lock);
+    if (count > 0)
+        log_message("Stopping %d active TCP relay(s)", count);
+}
+
 DWORD WINAPI udp_relay_server(LPVOID arg)
 {
     WSADATA wsa_data;
@@ -11,11 +97,15 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     int recv_len, from_len = 0;
 
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
+    {
+        publish_start_result(udp_relay_ready_event, &udp_relay_start_status, FALSE);
         return 1;
+    }
 
     udp_relay_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_relay_socket == INVALID_SOCKET)
     {
+        publish_start_result(udp_relay_ready_event, &udp_relay_start_status, FALSE);
         WSACleanup();
         return 1;
     }
@@ -32,6 +122,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
 
     if (bind(udp_relay_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == SOCKET_ERROR)
     {
+        publish_start_result(udp_relay_ready_event, &udp_relay_start_status, FALSE);
         closesocket(udp_relay_socket);
         udp_relay_socket = INVALID_SOCKET;
         WSACleanup();
@@ -57,6 +148,10 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
             udp_relay_socket6 = INVALID_SOCKET;
         }
     }
+
+    // Binding is the readiness boundary. SOCKS5 associations below may perform
+    // network I/O, but packet capture must not start before this local endpoint exists.
+    publish_start_result(udp_relay_ready_event, &udp_relay_start_status, TRUE);
 
     // Try initial UDP ASSOCIATE only for SOCKS5 configs that an enabled rule actually uses.
     // Skipping unreferenced configs avoids stalling the relay on dead/unused proxies.
@@ -405,6 +500,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
     {
         log_message("WSAStartup failed (%lu)", GetLastError());
+        publish_start_result(proxy_ready_event, &proxy_start_status, FALSE);
         return 1;
     }
 
@@ -412,6 +508,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     if (listen_sock == INVALID_SOCKET)
     {
         log_message("Socket creation failed (%d)", WSAGetLastError());
+        publish_start_result(proxy_ready_event, &proxy_start_status, FALSE);
         WSACleanup();
         return 1;
     }
@@ -430,6 +527,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
         log_message("Bind failed (%d)", WSAGetLastError());
+        publish_start_result(proxy_ready_event, &proxy_start_status, FALSE);
         closesocket(listen_sock);
         WSACleanup();
         return 1;
@@ -438,6 +536,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR)
     {
         log_message("Listen failed (%d)", WSAGetLastError());
+        publish_start_result(proxy_ready_event, &proxy_start_status, FALSE);
         closesocket(listen_sock);
         WSACleanup();
         return 1;
@@ -470,6 +569,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     }
 
     log_message("Local proxy listening on port %d", g_local_relay_port);
+    publish_start_result(proxy_ready_event, &proxy_start_status, TRUE);
 
     while (running)
     {
@@ -482,24 +582,6 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
 
         if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
             continue;
-
-        // helper lambda-like macro to accept and dispatch a connection
-        #define ACCEPT_AND_DISPATCH(sock, saddr_type, addr_field) do { \
-            saddr_type ca; int cl = sizeof(ca); \
-            SOCKET cs = accept(sock, (struct sockaddr*)&ca, &cl); \
-            if (cs == INVALID_SOCKET) break; \
-            CONNECTION_CONFIG *cc = (CONNECTION_CONFIG*)malloc(sizeof(CONNECTION_CONFIG)); \
-            if (cc == NULL) { closesocket(cs); break; } \
-            cc->client_socket = cs; \
-            UINT16 cp = ntohs(((saddr_type*)&ca)->addr_field); \
-            BOOL ok = cc->is_ipv6 ? \
-                get_connection_full_v6(cp, FALSE, cc->orig_dest_ip6, &cc->orig_dest_port, &cc->proxy_config_id) : \
-                get_connection_full(cp, FALSE, &cc->orig_dest_ip, &cc->orig_dest_port, &cc->proxy_config_id); \
-            if (!ok) { closesocket(cs); free(cc); break; } \
-            HANDLE t = CreateThread(NULL, 1, connection_handler, (LPVOID)cc, 0, NULL); \
-            if (t == NULL) { closesocket(cs); free(cc); break; } \
-            CloseHandle(t); \
-        } while(0)
 
         if (FD_ISSET(listen_sock, &read_fds))
         {
@@ -518,8 +600,12 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     UINT16 client_port = ntohs(client_addr.sin_port);
                     if (get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
                     {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                        if (begin_connection_worker())
+                        {
+                            HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
+                            if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                            else { end_connection_worker(); closesocket(client_sock); free(conn_config); }
+                        }
                         else { closesocket(client_sock); free(conn_config); }
                     }
                     else { closesocket(client_sock); free(conn_config); }
@@ -545,8 +631,12 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     UINT16 client_port = ntohs(client_addr6.sin6_port);
                     if (get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
                     {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                        if (begin_connection_worker())
+                        {
+                            HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
+                            if (conn_thread != NULL) { CloseHandle(conn_thread); }
+                            else { end_connection_worker(); closesocket(client_sock6); free(conn_config); }
+                        }
                         else { closesocket(client_sock6); free(conn_config); }
                     }
                     else { closesocket(client_sock6); free(conn_config); }
@@ -556,15 +646,13 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
         }
     }
 
-    #undef ACCEPT_AND_DISPATCH
-
     closesocket(listen_sock);
     if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
     WSACleanup();
     return 0;
 }
 
-DWORD WINAPI connection_handler(LPVOID arg)
+static DWORD connection_handler_impl(LPVOID arg)
 {
     CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)arg;
     SOCKET client_sock = config->client_socket;
@@ -703,6 +791,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
     return 0;
 }
 
+DWORD WINAPI connection_handler(LPVOID arg)
+{
+    DWORD result = connection_handler_impl(arg);
+    end_connection_worker();
+    return result;
+}
+
 // One-directional relay: reads from `from` and writes to `to`.
 // Runs as a dedicated thread so upload and download never block each other.
 // Uses a shared RELAY_PAIR reference count for safe socket cleanup. A clean EOF
@@ -721,11 +816,31 @@ DWORD WINAPI one_way_relay(LPVOID arg)
     char *buf = (char *)malloc(131072);  // 128 KB per-direction buffer
     if (buf)
     {
-        int len;
-        while ((len = recv(from, buf, 131072, 0)) > 0)
+        int len = SOCKET_ERROR;
+        for (;;)
         {
-            if (send_all(to, buf, len) == SOCKET_ERROR)
+            if (shutdown_event != NULL &&
+                WaitForSingleObject(shutdown_event, 0) == WAIT_OBJECT_0)
                 break;
+
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(from, &read_fds);
+            struct timeval timeout = {1, 0};
+            int ready = select(0, &read_fds, NULL, NULL, &timeout);
+            if (ready == 0)
+                continue;
+            if (ready == SOCKET_ERROR)
+                break;
+
+            len = recv(from, buf, 131072, 0);
+            if (len <= 0)
+                break;
+            if (send_all(to, buf, len) == SOCKET_ERROR)
+            {
+                len = SOCKET_ERROR;
+                break;
+            }
         }
         clean_eof = (len == 0);
         free(buf);
@@ -749,6 +864,7 @@ DWORD WINAPI one_way_relay(LPVOID arg)
     // Last thread out closes and frees everything.
     if (InterlockedDecrement(&pair->refs) == 0)
     {
+        unregister_relay_pair(pair);
         closesocket(pair->sock_client);
         closesocket(pair->sock_proxy);
         free(pair);
@@ -778,6 +894,16 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     pair->sock_client = sock_client;
     pair->sock_proxy  = sock_proxy;
     pair->refs        = 2;
+    pair->next        = NULL;
+    pair->registered  = FALSE;
+
+    if (!register_relay_pair(pair))
+    {
+        free(pair);
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 0;
+    }
 
     // Upload: client → proxy  (dedicated thread - may block on slow proxy send)
     ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
@@ -788,6 +914,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     {
         free(up);
         free(dn);
+        unregister_relay_pair(pair);
         free(pair);
         closesocket(sock_client);
         closesocket(sock_proxy);
@@ -803,6 +930,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     {
         free(up);
         free(dn);
+        unregister_relay_pair(pair);
         free(pair);
         closesocket(sock_client);
         closesocket(sock_proxy);

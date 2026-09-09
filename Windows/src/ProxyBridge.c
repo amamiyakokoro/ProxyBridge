@@ -34,6 +34,13 @@ HANDLE owner_update_event = NULL;
 HANDLE proxy_thread = NULL;
 HANDLE udp_relay_thread = NULL;
 HANDLE cleanup_thread = NULL;
+HANDLE shutdown_event = NULL;
+HANDLE proxy_ready_event = NULL;
+HANDLE udp_relay_ready_event = NULL;
+HANDLE connection_workers_done_event = NULL;
+volatile LONG proxy_start_status = 0;
+volatile LONG udp_relay_start_status = 0;
+volatile LONG active_connection_workers = 0;
 PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE] = {NULL};
 OWNER_CACHE_ENTRY *owner_cache[OWNER_CACHE_SIZE] = {NULL};
 volatile BOOL g_has_active_rules = FALSE;
@@ -185,7 +192,7 @@ static void stop_owner_observers(void)
     {
         if (*threads[i] != NULL)
         {
-            WaitForSingleObject(*threads[i], 1000);
+            WaitForSingleObject(*threads[i], INFINITE);
             CloseHandle(*threads[i]);
             *threads[i] = NULL;
         }
@@ -236,28 +243,101 @@ static BOOL start_owner_observers(INT16 priority)
     return TRUE;
 }
 
+#define PACKET_BATCH_BUFFER_SIZE (PACKET_BATCH_SIZE * WINDIVERT_MTU_MAX)
+
+typedef struct PACKET_SEND_BATCH {
+    UINT8 *packets;
+    UINT capacity;
+    UINT length;
+    UINT count;
+    WINDIVERT_ADDRESS addresses[PACKET_BATCH_SIZE];
+} PACKET_SEND_BATCH;
+
+static BOOL queue_packet_for_send(PACKET_SEND_BATCH *batch, const VOID *packet,
+                                  UINT packet_len, const WINDIVERT_ADDRESS *addr)
+{
+    if (batch->count >= PACKET_BATCH_SIZE ||
+        packet_len > batch->capacity - batch->length)
+    {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    memcpy(batch->packets + batch->length, packet, packet_len);
+    batch->addresses[batch->count] = *addr;
+    batch->length += packet_len;
+    batch->count++;
+    return TRUE;
+}
+
 DWORD WINAPI packet_processor(LPVOID arg)
 {
-    unsigned char packet[MAXBUF];
-    UINT packet_len;
-    WINDIVERT_ADDRESS addr;
+    UINT8 *recv_packets = (UINT8 *)malloc(PACKET_BATCH_BUFFER_SIZE);
+    UINT8 *send_packets = (UINT8 *)malloc(PACKET_BATCH_BUFFER_SIZE);
+    WINDIVERT_ADDRESS recv_addresses[PACKET_BATCH_SIZE];
+    PACKET_SEND_BATCH send_batch;
     PWINDIVERT_IPHDR ip_header;
     PWINDIVERT_TCPHDR tcp_header;
     PWINDIVERT_UDPHDR udp_header;
 
+    if (recv_packets == NULL || send_packets == NULL)
+    {
+        log_message("Failed to allocate packet batch buffers");
+        free(recv_packets);
+        free(send_packets);
+        return 1;
+    }
+
+    send_batch.packets = send_packets;
+    send_batch.capacity = PACKET_BATCH_BUFFER_SIZE;
+
+    // Existing per-packet branches use WinDivertSend as their pass/drop boundary.
+    // Queue those packets in order, then issue one SendEx after the available batch
+    // has been classified. RecvEx returns immediately; it never waits to fill 32.
+    #define WinDivertSend(handle, packet_ptr, length, sent, address) \
+        queue_packet_for_send(&send_batch, packet_ptr, length, address)
+
     while (running)
     {
-        if (!WinDivertRecv(windivert_handle, packet, sizeof(packet), &packet_len, &addr))
+        UINT recv_len = 0;
+        UINT addr_len = sizeof(recv_addresses);
+        if (!WinDivertRecvEx(windivert_handle, recv_packets,
+                             PACKET_BATCH_BUFFER_SIZE, &recv_len, 0,
+                             recv_addresses, &addr_len, NULL))
         {
-            if (GetLastError() == ERROR_INVALID_HANDLE)
+            DWORD error = GetLastError();
+            if (error == ERROR_INVALID_HANDLE || error == ERROR_NO_DATA ||
+                error == ERROR_OPERATION_ABORTED)
                 break;
-            log_message("Failed to receive packet (%lu)", GetLastError());
+            log_message("Failed to receive packet batch (%lu)", error);
             continue;
         }
 
+        UINT packet_count = addr_len / sizeof(WINDIVERT_ADDRESS);
+        UINT8 *packet = recv_packets;
+        UINT remaining = recv_len;
+        PVOID next_packet = NULL;
+        UINT next_len = 0;
+        send_batch.length = 0;
+        send_batch.count = 0;
+
+        for (UINT packet_index = 0;
+             packet_index < packet_count && remaining > 0;
+             packet_index++, packet = (UINT8 *)next_packet, remaining = next_len)
+        {
+        UINT packet_len;
+        WINDIVERT_ADDRESS addr = recv_addresses[packet_index];
         PWINDIVERT_IPV6HDR ipv6_header = NULL;
-        WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL,
-            NULL, NULL, &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+        next_packet = NULL;
+        next_len = 0;
+        if (!WinDivertHelperParsePacket(packet, remaining, &ip_header, &ipv6_header, NULL,
+                NULL, NULL, &tcp_header, &udp_header, NULL, NULL,
+                &next_packet, &next_len))
+        {
+            log_message("Failed to parse packet in batch");
+            continue;
+        }
+        packet_len = remaining - next_len;
 
         if (ip_header == NULL)
         {
@@ -1051,10 +1131,25 @@ DWORD WINAPI packet_processor(LPVOID arg)
         WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
         if (!WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr))
         {
-            log_message("Failed to send packet (%lu)", GetLastError());
+            log_message("Failed to queue packet for batch send (%lu)", GetLastError());
+        }
+        }
+
+        if (send_batch.count > 0 &&
+            !WinDivertSendEx(windivert_handle, send_batch.packets,
+                             send_batch.length, NULL, 0, send_batch.addresses,
+                             send_batch.count * sizeof(WINDIVERT_ADDRESS), NULL))
+        {
+            DWORD error = GetLastError();
+            if (running && error != ERROR_INVALID_HANDLE && error != ERROR_NO_DATA &&
+                error != ERROR_OPERATION_ABORTED)
+                log_message("Failed to send packet batch (%lu)", error);
         }
     }
 
+    #undef WinDivertSend
+    free(recv_packets);
+    free(send_packets);
     return 0;
 }
 
@@ -1112,19 +1207,114 @@ PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void)
     log_message("Connection logs cleared");
 }
 
+static void close_thread(HANDLE *thread)
+{
+    if (*thread == NULL)
+        return;
+    WaitForSingleObject(*thread, INFINITE);
+    CloseHandle(*thread);
+    *thread = NULL;
+}
+
+static void close_lifecycle_events(void)
+{
+    HANDLE *events[] = {
+        &shutdown_event,
+        &proxy_ready_event,
+        &udp_relay_ready_event,
+        &connection_workers_done_event
+    };
+    for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++)
+    {
+        if (*events[i] != NULL)
+        {
+            CloseHandle(*events[i]);
+            *events[i] = NULL;
+        }
+    }
+}
+
+static BOOL create_lifecycle_events(void)
+{
+    shutdown_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    proxy_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    udp_relay_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    connection_workers_done_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (shutdown_event == NULL || proxy_ready_event == NULL ||
+        udp_relay_ready_event == NULL || connection_workers_done_event == NULL)
+    {
+        log_message("Failed to create lifecycle events (%lu)", GetLastError());
+        close_lifecycle_events();
+        return FALSE;
+    }
+    InterlockedExchange(&proxy_start_status, 0);
+    InterlockedExchange(&udp_relay_start_status, 0);
+    InterlockedExchange(&active_connection_workers, 0);
+    return TRUE;
+}
+
+static BOOL wait_for_worker_ready(HANDLE event, volatile LONG *status,
+                                  const char *worker_name)
+{
+    DWORD wait_result = WaitForSingleObject(event, WORKER_START_TIMEOUT_MS);
+    if (wait_result == WAIT_OBJECT_0 && InterlockedCompareExchange(status, 0, 0) == 1)
+        return TRUE;
+    log_message("%s failed to become ready (wait=%lu status=%ld)", worker_name,
+                wait_result, InterlockedCompareExchange(status, 0, 0));
+    return FALSE;
+}
+
+static void request_runtime_stop(void)
+{
+    running = FALSE;
+    if (shutdown_event != NULL)
+        SetEvent(shutdown_event);
+
+    if (windivert_handle != INVALID_HANDLE_VALUE)
+    {
+        // Stop new receives but keep injection available until a worker finishes
+        // the batch it already owns.
+        WinDivertShutdown(windivert_handle, WINDIVERT_SHUTDOWN_RECV);
+    }
+
+    stop_owner_observers();
+    abort_active_relays();
+}
+
+static void wait_for_runtime_workers(void)
+{
+    for (int i = 0; i < NUM_PACKET_THREADS; i++)
+        close_thread(&packet_thread[i]);
+    if (windivert_handle != INVALID_HANDLE_VALUE)
+    {
+        WinDivertShutdown(windivert_handle, WINDIVERT_SHUTDOWN_BOTH);
+        WinDivertClose(windivert_handle);
+        windivert_handle = INVALID_HANDLE_VALUE;
+    }
+    close_thread(&proxy_thread);
+    close_thread(&udp_relay_thread);
+    close_thread(&cleanup_thread);
+
+    // The listener is gone and running==FALSE prevents new registrations.
+    // Active relay pairs were shutdown above, so every detached connection
+    // worker can now drain before shared state is released.
+    if (connection_workers_done_event != NULL)
+        WaitForSingleObject(connection_workers_done_event, INFINITE);
+}
+
 // Dedicated cleanup thread - runs independently without blocking packet processing
 DWORD WINAPI cleanup_worker(LPVOID arg)
 {
     while (running)
     {
-        Sleep(30000);  // 30 seconds
-        if (running)
-        {
-            cleanup_stale_connections();
-            cleanup_stale_pid_cache();
-            cleanup_stale_owner_cache();
-            cleanup_stale_dns_cache();
-        }
+        if (WaitForSingleObject(shutdown_event, 30000) == WAIT_OBJECT_0)
+            break;
+        if (!running)
+            break;
+        cleanup_stale_connections();
+        cleanup_stale_pid_cache();
+        cleanup_stale_owner_cache();
+        cleanup_stale_dns_cache();
     }
     return 0;
 }
@@ -1145,52 +1335,31 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     if (g_has_domain_rules)
         flush_dns_resolver_cache();
 
+    if (!create_lifecycle_events())
+        return FALSE;
     running = TRUE;
 
     if (!start_owner_observers(priority))
-    {
-        running = FALSE;
-        return FALSE;
-    }
+        goto start_failed;
 
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
-    if (proxy_thread == NULL)
-    {
-        running = FALSE;
-        stop_owner_observers();
-        return FALSE;
-    }
-
-    // Start cleanup thread to avoid blocking packet processing
-    cleanup_thread = CreateThread(NULL, 1, cleanup_worker, NULL, 0, NULL);
-    if (cleanup_thread == NULL)
-    {
-        running = FALSE;
-        stop_owner_observers();
-        WaitForSingleObject(proxy_thread, INFINITE);
-        CloseHandle(proxy_thread);
-        proxy_thread = NULL;
-        return FALSE;
-    }
+    if (proxy_thread == NULL ||
+        !wait_for_worker_ready(proxy_ready_event, &proxy_start_status, "TCP relay"))
+        goto start_failed;
 
     if (any_socks5_config())
     {
         udp_relay_thread = CreateThread(NULL, 1, udp_relay_server, NULL, 0, NULL);
-        if (udp_relay_thread == NULL)
-        {
-            running = FALSE;
-            stop_owner_observers();
-            WaitForSingleObject(cleanup_thread, INFINITE);
-            CloseHandle(cleanup_thread);
-            cleanup_thread = NULL;
-            WaitForSingleObject(proxy_thread, INFINITE);
-            CloseHandle(proxy_thread);
-            proxy_thread = NULL;
-            return FALSE;
-        }
+        if (udp_relay_thread == NULL ||
+            !wait_for_worker_ready(udp_relay_ready_event,
+                                   &udp_relay_start_status, "UDP relay"))
+            goto start_failed;
     }
 
-    Sleep(500);
+    // Start cleanup only after both relay listeners have reported ready.
+    cleanup_thread = CreateThread(NULL, 1, cleanup_worker, NULL, 0, NULL);
+    if (cleanup_thread == NULL)
+        goto start_failed;
 
     // "not impostor" ensures WinDivert never re-captures packets it already injected.
     // Without this, each WinDivertSend re-enters the capture queue, creating
@@ -1240,12 +1409,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
                 log_message("Failed to open WinDivert (%lu): Ensure ProxyBridge is installed correctly and running as Administrator.", wd_err);
                 break;
         }
-        running = FALSE;
-        stop_owner_observers();
-        WaitForSingleObject(proxy_thread, INFINITE);
-        CloseHandle(proxy_thread);
-        proxy_thread = NULL;
-        return FALSE;
+        goto start_failed;
     }
 
     // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32–16384).
@@ -1266,25 +1430,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     {
         packet_thread[i] = CreateThread(NULL, 0, packet_processor, NULL, 0, NULL);
         if (packet_thread[i] == NULL)
-        {
-            running = FALSE;
-            stop_owner_observers();
-            for (int j = 0; j < i; j++)
-            {
-                if (packet_thread[j] != NULL)
-                {
-                    WaitForSingleObject(packet_thread[j], 5000);
-                    CloseHandle(packet_thread[j]);
-                    packet_thread[j] = NULL;
-                }
-            }
-            WinDivertClose(windivert_handle);
-            windivert_handle = INVALID_HANDLE_VALUE;
-            WaitForSingleObject(proxy_thread, INFINITE);
-            CloseHandle(proxy_thread);
-            proxy_thread = NULL;
-            return FALSE;
-        }
+            goto start_failed;
     }
 
     update_has_active_rules();
@@ -1316,6 +1462,12 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         log_message("No rules configured - all traffic will be direct");
 
     return TRUE;
+
+start_failed:
+    request_runtime_stop();
+    wait_for_runtime_workers();
+    close_lifecycle_events();
+    return FALSE;
 }
 
 PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
@@ -1323,48 +1475,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     if (!running)
         return FALSE;
 
-    running = FALSE;
-
-    if (windivert_handle != INVALID_HANDLE_VALUE)
-    {
-        WinDivertShutdown(windivert_handle, WINDIVERT_SHUTDOWN_BOTH);
-        WinDivertClose(windivert_handle);
-        windivert_handle = INVALID_HANDLE_VALUE;
-    }
-
-    stop_owner_observers();
-
-    // process alll packets before we stop, make sure packets are not dropped
-    for (int i = 0; i < NUM_PACKET_THREADS; i++)
-    {
-        if (packet_thread[i] != NULL)
-        {
-            WaitForSingleObject(packet_thread[i], 1000);  // 1 second timeout
-            CloseHandle(packet_thread[i]);
-            packet_thread[i] = NULL;
-        }
-    }
-
-    if (proxy_thread != NULL)
-    {
-        WaitForSingleObject(proxy_thread, 1000);  // 1 second timeout
-        CloseHandle(proxy_thread);
-        proxy_thread = NULL;
-    }
-
-    if (cleanup_thread != NULL)
-    {
-        WaitForSingleObject(cleanup_thread, 1000);  // 1 second timeout
-        CloseHandle(cleanup_thread);
-        cleanup_thread = NULL;
-    }
-
-    if (udp_relay_thread != NULL)
-    {
-        WaitForSingleObject(udp_relay_thread, 1000);  // 1 second timeout
-        CloseHandle(udp_relay_thread);
-        udp_relay_thread = NULL;
-    }
+    request_runtime_stop();
+    wait_for_runtime_workers();
 
     AcquireSRWLockExclusive(&lock);
     for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
@@ -1396,6 +1508,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     // if ProxyBridge is stopped and restarted with different rules.
     memset((void*)port_decided_bitmap, 0, sizeof(port_decided_bitmap));
     memset((void*)port_direct_bitmap,  0, sizeof(port_direct_bitmap));
+
+    close_lifecycle_events();
 
     log_message("ProxyBridge stopped");
 

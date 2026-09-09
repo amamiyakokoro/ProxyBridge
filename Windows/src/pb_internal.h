@@ -33,6 +33,10 @@
 #define OWNER_LOOKUP_WAIT_SLICE_MS 10
 #define OWNER_CACHE_SIZE 2048
 #define OWNER_CACHE_TTL_MS 120000
+#define WORKER_START_TIMEOUT_MS 5000
+#ifndef PACKET_BATCH_SIZE
+#define PACKET_BATCH_SIZE 16
+#endif
 // Single packet-processor thread eliminates TCP packet reordering.
 // With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
 // can re-inject its segment before thread N injects segment N, causing the
@@ -132,10 +136,12 @@ typedef struct {
 
 // Two-thread bidirectional relay: each direction runs in its own thread so
 // a slow proxy (upload) never stalls the download pipe and vice-versa.
-typedef struct {
+typedef struct RELAY_PAIR {
     SOCKET sock_client;   // app-side socket
     SOCKET sock_proxy;    // proxy-side socket
     volatile LONG refs;   // ref-count; last thread out closes both sockets
+    struct RELAY_PAIR *next;
+    BOOL registered;
 } RELAY_PAIR;
 
 typedef struct {
@@ -215,6 +221,13 @@ extern HANDLE owner_update_event;
 extern HANDLE proxy_thread;
 extern HANDLE udp_relay_thread;
 extern HANDLE cleanup_thread;
+extern HANDLE shutdown_event;
+extern HANDLE proxy_ready_event;
+extern HANDLE udp_relay_ready_event;
+extern HANDLE connection_workers_done_event;
+extern volatile LONG proxy_start_status;
+extern volatile LONG udp_relay_start_status;
+extern volatile LONG active_connection_workers;
 extern PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE];
 extern OWNER_CACHE_ENTRY *owner_cache[OWNER_CACHE_SIZE];
 extern volatile BOOL g_has_active_rules;
@@ -382,6 +395,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg);
 DWORD WINAPI connection_handler(LPVOID arg);
 DWORD WINAPI one_way_relay(LPVOID arg);
 DWORD WINAPI transfer_handler(LPVOID arg);
+void abort_active_relays(void);
 
 // ---- ProxyBridge.c ----
 DWORD WINAPI packet_processor(LPVOID arg);
