@@ -966,10 +966,10 @@ class AppProxyProvider: NETransparentProxyProvider {
         let processName = getProcessName(from: metaData)
         let displayName = processName ?? processPath
         
-        // domains that resolved to this ip (from the dns proxy), used for domain
-        // rules and to show the hostname in the log instead of the raw ip
-        let domains = DNSMapStore.shared.domains(forIP: destination)
-        let logDest = domains.first ?? destination
+        // KokoroBox does not ship the standalone DNS proxy provider, so legacy
+        // rules never receive a DNS-derived domain alias.
+        let domains: [String] = []
+        let logDest = destination
 
         proxyLock.lock()
         let hasProxyConfig = !storedProxyConfigs.isEmpty

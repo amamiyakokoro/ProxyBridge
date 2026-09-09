@@ -1,100 +1,35 @@
-name: Build macOS
+name: Build macOS routing extension
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-on:
-  push:
-    branches: [dev, main, master]
-  pull_request:
-    branches: [dev, main, master]
-  workflow_dispatch:
-
 jobs:
   build:
     runs-on: macos-latest
-    permissions:
-      contents: read
-      actions: read
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Xcode
-        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
-        with:
-          xcode-version: latest-stable
-
-      # Release builds reference local xcconfig files that normally contain
-      # signing settings. CI only needs their non-secret product metadata.
-      - name: Create unsigned build configuration
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build unsigned extension
         run: |
-          cat > MacOS/ProxyBridge/Signing-Config-app.xcconfig << 'EOF'
-          PRODUCT_MODULE_NAME = ProxyBridge
-          PRODUCT_NAME = ProxyBridge
-          PRODUCT_BUNDLE_IDENTIFIER = com.interceptsuite.ProxyBridge
-          ARCHS = arm64 x86_64
-          ONLY_ACTIVE_ARCH = NO
-          EOF
-
-          # PRODUCT_NAME must match the extension filename referenced by the
-          # app target's Embed System Extensions phase.
-          cat > MacOS/ProxyBridge/Signing-Config-ext.xcconfig << 'EOF'
-          PRODUCT_MODULE_NAME = com_interceptsuite_ProxyBridge_extension
-          PRODUCT_NAME = com.interceptsuite.ProxyBridge.extension
-          PRODUCT_BUNDLE_IDENTIFIER = com.interceptsuite.ProxyBridge.extension
-          ARCHS = arm64 x86_64
-          ONLY_ACTIVE_ARCH = NO
-          EOF
-
-      - name: Build universal app without signing
-        run: |
-          cd MacOS/ProxyBridge
           xcodebuild \
-            -project ProxyBridge.xcodeproj \
-            -scheme ProxyBridge \
-            -configuration Release \
+            -project MacOS/ProxyBridge/ProxyBridge.xcodeproj \
+            -scheme extension \
+            -configuration Debug \
             -derivedDataPath build/DerivedData \
-            ARCHS="arm64 x86_64" \
-            ONLY_ACTIVE_ARCH=NO \
+            -xcconfig MacOS/ProxyBridge/kokorobox-ext.xcconfig \
+            KOKOROBOX_TARGET_ARCH=arm64 \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            clean build
-
-      - name: Verify universal binaries
-        run: |
-          APP="MacOS/ProxyBridge/build/DerivedData/Build/Products/Release/ProxyBridge.app"
-          EXT="$APP/Contents/Library/SystemExtensions/com.interceptsuite.ProxyBridge.extension.systemextension"
-
-          assert_universal() {
-            local binary="$1"
-            local architectures
-            architectures="$(lipo -archs "$binary")"
-            echo "Architectures for $binary: $architectures"
-            [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]
-          }
-
-          assert_universal "$APP/Contents/MacOS/ProxyBridge"
-          assert_universal "$EXT/Contents/MacOS/com.interceptsuite.ProxyBridge.extension"
-
-      - name: Archive unsigned build
-        run: |
-          ditto -c -k --keepParent \
-            MacOS/ProxyBridge/build/DerivedData/Build/Products/Release/ProxyBridge.app \
-            /tmp/ProxyBridge-macOS-unsigned.zip
-
-      - name: Upload unsigned build
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+            build
+      - name: Verify extension product
+        run: test -f build/DerivedData/Build/Products/Debug/KokoroBoxProxyExtension.systemextension/Contents/MacOS/KokoroBoxProxyExtension
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ProxyBridge-macOS-unsigned
-          path: /tmp/ProxyBridge-macOS-unsigned.zip
+          name: kokorobox-proxybridge-extension-${{ github.sha }}
+          path: build/DerivedData/Build/Products/Debug/KokoroBoxProxyExtension.systemextension
           retention-days: 7
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -f MacOS/ProxyBridge/Signing-Config-app.xcconfig
-          rm -f MacOS/ProxyBridge/Signing-Config-ext.xcconfig
-          rm -f /tmp/ProxyBridge-macOS-unsigned.zip
