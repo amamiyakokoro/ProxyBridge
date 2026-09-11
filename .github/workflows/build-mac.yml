@@ -27,7 +27,19 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
       - name: Verify extension product
-        run: test -f build/DerivedData/Build/Products/Debug/KokoroBoxProxyExtension.systemextension/Contents/MacOS/KokoroBoxProxyExtension
+        run: |
+          EXTENSION="build/DerivedData/Build/Products/Debug/KokoroBoxProxyExtension.systemextension"
+          INFO="$EXTENSION/Contents/Info.plist"
+          test -f "$EXTENSION/Contents/MacOS/KokoroBoxProxyExtension"
+
+          plist_value() {
+            /usr/libexec/PlistBuddy -c "Print :$1" "$INFO"
+          }
+          test "$(plist_value CFBundleIdentifier)" = "com.amamiyakokoro.app.proxy-extension"
+          test "$(plist_value CFBundleExecutable)" = "KokoroBoxProxyExtension"
+          test "$(plist_value CFBundlePackageType)" = "SYSX"
+          test -n "$(plist_value CFBundleShortVersionString)"
+          test -n "$(plist_value CFBundleVersion)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kokorobox-proxybridge-extension-${{ github.sha }}

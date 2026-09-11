@@ -5,6 +5,7 @@ PRODUCT_NAME = KokoroBoxProxyExtension
 PRODUCT_BUNDLE_IDENTIFIER = com.amamiyakokoro.app.proxy-extension
 PRODUCT_MODULE_NAME = KokoroBoxProxyExtension
 INFOPLIST_FILE = extension/Info.KokoroBox.plist
+GENERATE_INFOPLIST_FILE = YES
 CODE_SIGN_ENTITLEMENTS = extension/KokoroBox.entitlements
 MACOSX_DEPLOYMENT_TARGET = 13.0
 ENABLE_HARDENED_RUNTIME = YES
