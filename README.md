@@ -12,7 +12,7 @@ KokoroBox pins this repository by commit and reuses only these components:
 | Platform | Reused component | Integration |
 | --- | --- | --- |
 | Windows 10/11 x64 | `ProxyBridgeCore.dll` | A controlled process-router sidecar installs executable-path rules and routes selected applications through KokoroBox's local Mihomo SOCKS5 listener. |
-| macOS 13+ | `NETransparentProxyProvider` system extension | KokoroBox atomically installs signing-identifier rules and routes selected applications through the fixed `127.0.0.1:7891` SOCKS5 endpoint. |
+| macOS 13+ | `NETransparentProxyProvider` system extension | KokoroBox atomically installs typed signing-identifier or process-name rules and routes selected applications through the fixed `127.0.0.1:7891` SOCKS5 endpoint. |
 
 This repository intentionally contains no GUI, updater, CLI, installer, DNS
 proxy provider, or Linux implementation.
@@ -23,9 +23,10 @@ proxy provider, or Linux implementation.
   becomes `BLOCK`, never `DIRECT`.
 - Windows adds opt-in, per-application UDP/53 routing and room for atomic
   rule replacement.
-- macOS accepts an atomic signing-identifier policy for the fixed local SOCKS5
-  endpoint and excludes KokoroBox, Mihomo, and local/control traffic to avoid
-  loops.
+- macOS accepts an atomic, typed identity policy for the fixed local SOCKS5
+  endpoint. Signing identifiers are the stable default; explicit process-name
+  rules are resolved from the flow audit token. KokoroBox, Mihomo, and
+  local/control traffic remain excluded to avoid loops.
 
 See [KOKOROBOX.md](KOKOROBOX.md) for the complete integration contract.
 
