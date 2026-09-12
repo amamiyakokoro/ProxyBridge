@@ -30,5 +30,7 @@ KokoroBox-owned process router and must not be exposed beyond localhost.
 
 On macOS, the extension accepts only KokoroBox's versioned policy protocol,
 uses the fixed local SOCKS endpoint, and turns unavailable proxy service into
-`BLOCK` rather than `DIRECT`. Its app group and Network Extension entitlement
-are limited to KokoroBox's identifiers.
+`BLOCK` rather than `DIRECT`. Rules carry an explicit identity kind: stable
+signing identifiers are never implicitly confused with the less-trusted
+process names resolved from audit tokens. Its app group and Network Extension
+entitlement are limited to KokoroBox's identifiers.

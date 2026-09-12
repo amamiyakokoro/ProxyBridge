@@ -270,8 +270,14 @@ struct ProxyRule: Codable {
     }
 }
 
+private enum KokoroBoxIdentifierKind: String, Codable {
+    case signingIdentifier = "SIGNING_IDENTIFIER"
+    case processName = "PROCESS_NAME"
+}
+
 private struct KokoroBoxRule: Codable {
     let signingIdentifier: String
+    let identifierKind: KokoroBoxIdentifierKind?
     let ruleProtocol: RuleProtocol
     let action: String
     let enabled: Bool
@@ -484,10 +490,16 @@ class AppProxyProvider: NETransparentProxyProvider {
         return patternIndex == pattern.count
     }
 
-    private static func validSigningIdentifier(_ value: String) -> Bool {
+    private static func validRuleIdentifier(
+        _ value: String,
+        kind: KokoroBoxIdentifierKind
+    ) -> Bool {
         guard !value.isEmpty, value != "*", value.utf8.count <= 512 else { return false }
         return value.unicodeScalars.allSatisfy {
-            $0.value >= 0x21 && $0.value <= 0x7e && !";,?\\/\"".unicodeScalars.contains($0)
+            let printable = kind == .processName
+                ? $0.value >= 0x20 && $0.value != 0x7f
+                : $0.value >= 0x21 && $0.value <= 0x7e
+            return printable && !";,?\\/\"".unicodeScalars.contains($0)
         }
     }
 
@@ -505,8 +517,9 @@ class AppProxyProvider: NETransparentProxyProvider {
         var priorities = Set<Int>()
         var identifiers = Set<String>()
         for rule in configuration.rules {
-            let identifier = rule.signingIdentifier.lowercased()
-            guard Self.validSigningIdentifier(rule.signingIdentifier),
+            let identifierKind = rule.identifierKind ?? .signingIdentifier
+            let identifier = "\(identifierKind.rawValue):\(rule.signingIdentifier.lowercased())"
+            guard Self.validRuleIdentifier(rule.signingIdentifier, kind: identifierKind),
                   ["PROXY", "DIRECT", "BLOCK"].contains(rule.action),
                   rule.priority > 0,
                   rule.priority <= 256,
@@ -619,6 +632,7 @@ class AppProxyProvider: NETransparentProxyProvider {
 
     private func kokoroBoxDecision(
         signingIdentifier: String,
+        processName: String?,
         connectionProtocol: RuleProtocol
     ) -> KokoroBoxDecision? {
         guard let configuration = currentKokoroBoxConfiguration() else { return nil }
@@ -631,8 +645,16 @@ class AppProxyProvider: NETransparentProxyProvider {
             .filter { $0.enabled }
             .sorted { $0.priority < $1.priority }
             .first {
-                ($0.ruleProtocol == .both || $0.ruleProtocol == connectionProtocol) &&
-                Self.globMatch($0.signingIdentifier, signingIdentifier)
+                guard $0.ruleProtocol == .both || $0.ruleProtocol == connectionProtocol else {
+                    return false
+                }
+                switch $0.identifierKind ?? .signingIdentifier {
+                case .signingIdentifier:
+                    return Self.globMatch($0.signingIdentifier, signingIdentifier)
+                case .processName:
+                    guard let processName else { return false }
+                    return Self.globMatch($0.signingIdentifier, processName)
+                }
             }
         guard let rule else { return .direct }
         switch rule.action {
@@ -928,6 +950,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     private func handleTCPFlow(_ flow: NEAppProxyTCPFlow) -> Bool {
         let metaData = flow.metaData
         let processPath = metaData.sourceAppSigningIdentifier
+        let processName = getProcessName(from: metaData)
         
         // never proxy our own traffic, it would loop
         if processPath == "com.interceptsuite.ProxyBridge" || processPath == "com.interceptsuite.ProxyBridge.extension" {
@@ -950,7 +973,11 @@ class AppProxyProvider: NETransparentProxyProvider {
 
         if currentKokoroBoxConfiguration() != nil {
             guard !Self.isDirectNetworkTarget(destination) else { return false }
-            switch kokoroBoxDecision(signingIdentifier: processPath, connectionProtocol: .tcp) {
+            switch kokoroBoxDecision(
+                signingIdentifier: processPath,
+                processName: processName,
+                connectionProtocol: .tcp
+            ) {
             case .direct, .none:
                 return false
             case .block:
@@ -963,7 +990,6 @@ class AppProxyProvider: NETransparentProxyProvider {
             }
         }
         
-        let processName = getProcessName(from: metaData)
         let displayName = processName ?? processPath
         
         // KokoroBox does not ship the standalone DNS proxy provider, so legacy
@@ -1023,7 +1049,11 @@ class AppProxyProvider: NETransparentProxyProvider {
         let displayName = processName ?? processPath
 
         if currentKokoroBoxConfiguration() != nil {
-            switch kokoroBoxDecision(signingIdentifier: processPath, connectionProtocol: .udp) {
+            switch kokoroBoxDecision(
+                signingIdentifier: processPath,
+                processName: processName,
+                connectionProtocol: .udp
+            ) {
             case .direct, .none:
                 return false
             case .block:

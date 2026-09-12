@@ -19,8 +19,10 @@ versioned command protocol, installs mandatory loop-prevention rules, and does n
 ProxyBridge GUI or updater.
 
 The macOS integration reuses only the `NETransparentProxyProvider` system extension. A
-KokoroBox-specific provider message atomically replaces signing-identifier rules and the fixed
-`127.0.0.1:7891` SOCKS5 endpoint. In this controlled mode, unavailable proxy service resolves a
+KokoroBox-specific provider message atomically replaces typed signing-identifier or process-name
+rules and the fixed `127.0.0.1:7891` SOCKS5 endpoint. Signing identifiers come directly from
+`NEFlowMetaData`; process names are resolved from the source audit token and executable path. In
+this controlled mode, unavailable proxy service resolves a
 `PROXY` decision to `BLOCK`. KokoroBox, its helper and extension, Mihomo, loopback, link-local,
 multicast, and broadcast traffic are permanently excluded to prevent routing loops. The
 standalone SwiftUI GUI and DNS proxy provider are not embedded.
