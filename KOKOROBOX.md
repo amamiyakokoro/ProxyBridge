@@ -1,28 +1,24 @@
-# KokoroBox integration changes
+# KokoroBox integration
 
-This independently maintained repository is the pinned ProxyBridge source used by KokoroBox
-Desktop's Windows x64 application-routing feature. The original copyright and MIT license remain
-unchanged.
+KokoroBox Desktop pins this independently maintained repository at an exact commit and uses its Windows routing core and macOS system extension. The original copyright and [MIT license](LICENSE) remain unchanged.
 
-The KokoroBox integration carries three narrowly scoped Windows core changes:
+## Windows
 
-- A rule whose action is `PROXY` resolves to `BLOCK` when its proxy configuration is missing,
-  invalid, or incompatible with UDP. It never falls back to `DIRECT`.
-- An explicit API controls whether an application's own UDP/53 DNS queries participate in
-  `PROXY` rules, including TCP-only rules. It does not widen any other UDP traffic.
-- `MAX_PROCESS_NAME` is increased to 65536 bytes so the controlled router can atomically guard
-  a bounded list of canonical executable paths while replacing rules.
+KokoroBox builds `ProxyBridgeCore.dll` for Windows x64. The core includes three integration changes:
 
-KokoroBox builds `ProxyBridgeCore.dll` from this repository at an exact commit. Its separate
-`kokorobox-process-router.exe` wrapper supplies the fixed local SOCKS endpoint, validates a
-versioned command protocol, installs mandatory loop-prevention rules, and does not include the
-ProxyBridge GUI or updater.
+- A `PROXY` rule resolves to `BLOCK` when its proxy configuration is missing, invalid, or incompatible with UDP. It never falls back to `DIRECT`.
+- An explicit API controls whether an application's UDP/53 DNS queries participate in `PROXY` rules, including TCP-only rules. Other UDP traffic is unaffected.
+- `MAX_PROCESS_NAME` is 65536 bytes, allowing the controlled router to guard a bounded list of canonical executable paths during atomic rule replacement.
 
-The macOS integration reuses only the `NETransparentProxyProvider` system extension. A
-KokoroBox-specific provider message atomically replaces typed signing-identifier or process-name
-rules and the fixed `127.0.0.1:7891` SOCKS5 endpoint. Signing identifiers come directly from
-`NEFlowMetaData`; process names are resolved from the source audit token and executable path. In
-this controlled mode, unavailable proxy service resolves a
-`PROXY` decision to `BLOCK`. KokoroBox, its helper and extension, Mihomo, loopback, link-local,
-multicast, and broadcast traffic are permanently excluded to prevent routing loops. The
-standalone SwiftUI GUI and DNS proxy provider are not embedded.
+KokoroBox's separate `kokorobox-process-router.exe` supplies the fixed local SOCKS endpoint, validates a versioned command protocol, and installs mandatory rules to prevent routing loops.
+
+## macOS
+
+KokoroBox uses the `NETransparentProxyProvider` system extension. Its controlled mode has these boundaries:
+
+- A KokoroBox-specific provider message atomically replaces typed signing-identifier or process-name rules for the fixed `127.0.0.1:7891` SOCKS5 endpoint.
+- Signing identifiers come from `NEFlowMetaData`. Process names are resolved from the source audit token and executable path.
+- If the proxy service is unavailable, a `PROXY` decision resolves to `BLOCK`.
+- KokoroBox, its helper and extension, Mihomo, loopback, link-local, multicast, and broadcast traffic are excluded to prevent routing loops.
+
+This repository does not include the standalone ProxyBridge GUI, updater, or macOS DNS proxy provider. See the [Windows](Windows/README.md) and [macOS](MacOS/README.md) component guides for build details.
