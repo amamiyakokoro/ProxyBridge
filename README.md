@@ -1,53 +1,49 @@
+<div align="center">
+
 # ProxyBridge for KokoroBox
 
-This independently maintained repository supplies the application-routing
-components used by [KokoroBox Desktop](https://github.com/amamiyakokoro/KokoroBox-Desktop).
-It is not a standalone ProxyBridge distribution. Its supported surface is
-limited to the Windows core DLL and the KokoroBox macOS system extension.
+Windows and macOS application-routing components used by [KokoroBox Desktop](https://github.com/amamiyakokoro/KokoroBox-Desktop).
 
-## Scope
+[Integration](KOKOROBOX.md) · [Security](SECURITY.md) · [License](LICENSE)
 
-KokoroBox pins this repository by commit and reuses only these components:
+</div>
 
-| Platform | Reused component | Integration |
-| --- | --- | --- |
-| Windows 10/11 x64 | `ProxyBridgeCore.dll` | A controlled process-router sidecar installs executable-path rules and routes selected applications through KokoroBox's local Mihomo SOCKS5 listener. |
-| macOS 13+ | `NETransparentProxyProvider` system extension | KokoroBox atomically installs typed signing-identifier or process-name rules and routes selected applications through the fixed `127.0.0.1:7891` SOCKS5 endpoint. |
+## Features
 
-This repository intentionally contains no GUI, updater, CLI, installer, DNS
-proxy provider, or Linux implementation.
+- Windows `ProxyBridgeCore.dll` routes selected applications through KokoroBox's local Mihomo SOCKS5 listener using executable-path rules and optional per-application UDP/53 routing.
+- The macOS `NETransparentProxyProvider` system extension uses signing-identifier or process-name rules and the fixed `127.0.0.1:7891` SOCKS5 endpoint.
+- `PROXY` decisions resolve to `BLOCK` when the proxy configuration or service is unavailable, and both integrations exclude traffic that could cause routing loops.
 
-## KokoroBox changes
+## Supported platforms
 
-- `PROXY` decisions fail closed: unavailable or invalid proxy configuration
-  becomes `BLOCK`, never `DIRECT`.
-- Windows adds opt-in, per-application UDP/53 routing and room for atomic
-  rule replacement.
-- macOS accepts an atomic, typed identity policy for the fixed local SOCKS5
-  endpoint. Signing identifiers are the stable default; explicit process-name
-  rules are resolved from the flow audit token. KokoroBox, Mihomo, and
-  local/control traffic remain excluded to avoid loops.
+| Platform | Component |
+| --- | --- |
+| Windows 10/11 x64 | `ProxyBridgeCore.dll`, used with KokoroBox's process-router sidecar |
+| macOS 13+ | `NETransparentProxyProvider` system extension |
 
-See [KOKOROBOX.md](KOKOROBOX.md) for the complete integration contract.
+This repository is pinned by KokoroBox at an exact commit. It does not provide a standalone application, installer, updater, CLI, DNS proxy provider, or Linux implementation.
 
-## Build
+## Get started
 
-To build the Windows core on Windows 10/11 x64 with MSVC and WinDivert 2.2.2:
+Download [KokoroBox Desktop](https://github.com/amamiyakokoro/KokoroBox-Desktop/releases) to use application routing. These components are built and distributed through its release pipeline.
+
+## Development
+
+To build the Windows core, install Visual Studio C++ x64 tools and WinDivert 2.2.2-A on Windows 10/11 x64, then run:
 
 ```powershell
 cd Windows
 .\compile.ps1 -Compiler msvc -NoSign
 ```
 
-KokoroBox builds the macOS system extension from
-`MacOS/ProxyBridge/ProxyBridge.xcodeproj` using
-`MacOS/ProxyBridge/kokorobox-ext.xcconfig`; its release pipeline supplies the
-architecture and signing settings. Build output is verified and signed by the
-KokoroBox release pipeline.
+KokoroBox builds the macOS extension from `MacOS/ProxyBridge/ProxyBridge.xcodeproj` using `MacOS/ProxyBridge/kokorobox-ext.xcconfig`. Its release pipeline supplies the architecture and signing settings.
 
-## License and attribution
+## Documentation
 
-ProxyBridge is licensed under the [MIT License](LICENSE). Copyright and
-attribution from the original project is retained. The Windows
-implementation uses [WinDivert](https://reqrypt.org/windivert.html), whose
-license and redistribution requirements must also be preserved.
+- [KokoroBox integration contract](KOKOROBOX.md)
+- Component guides: [Windows](Windows/README.md), [macOS](MacOS/README.md)
+- [Security policy](SECURITY.md)
+
+## License
+
+ProxyBridge is licensed under the [MIT License](LICENSE), with the original copyright and attribution retained. The Windows implementation uses [WinDivert](https://reqrypt.org/windivert.html); its license and redistribution requirements also apply.
