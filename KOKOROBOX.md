@@ -11,6 +11,7 @@ KokoroBox builds `ProxyBridgeCore.dll` for Windows x64. The core includes three 
 - `MAX_PROCESS_NAME` is 65536 bytes, allowing the controlled router to guard a bounded list of canonical executable paths during atomic rule replacement.
 
 KokoroBox's separate `kokorobox-process-router.exe` supplies the fixed local SOCKS endpoint, validates a versioned command protocol, and installs mandatory rules to prevent routing loops.
+The Windows core rejects proxy credentials because SOCKS5 and HTTP proxy authentication would send them in cleartext.
 
 ## macOS
 

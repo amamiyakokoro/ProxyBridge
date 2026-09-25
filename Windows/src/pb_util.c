@@ -158,7 +158,7 @@ int send_all(SOCKET sock, const char *buf, int len)
     int sent = 0;
     while (sent < len) {
         int n = send(sock, buf + sent, len - sent, 0);
-        if (n == SOCKET_ERROR) return SOCKET_ERROR;
+        if (n <= 0) return SOCKET_ERROR;
         sent += n;
     }
     return sent;
@@ -230,24 +230,3 @@ UINT32 resolve_hostname(const char *hostname)
 
     return resolved_ip;
 }
-
-void base64_encode(const char* input, char* output, size_t output_size)
-{
-    static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t input_len = strnlen_s(input, output_size * 2);
-    size_t output_len = 0;
-
-    for (size_t i = 0; i < input_len && output_len < output_size - 4; i += 3)
-    {
-        unsigned char b1 = input[i];
-        unsigned char b2 = (i + 1 < input_len) ? input[i + 1] : 0;
-        unsigned char b3 = (i + 2 < input_len) ? input[i + 2] : 0;
-
-        output[output_len++] = base64_chars[b1 >> 2];
-        output[output_len++] = base64_chars[((b1 & 0x03) << 4) | (b2 >> 4)];
-        output[output_len++] = (i + 1 < input_len) ? base64_chars[((b2 & 0x0F) << 2) | (b3 >> 6)] : '=';
-        output[output_len++] = (i + 2 < input_len) ? base64_chars[b3 & 0x3F] : '=';
-    }
-    output[output_len] = '\0';
-}
-

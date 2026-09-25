@@ -57,6 +57,12 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
         return 0;
 
+    // Neither SOCKS5 username/password nor HTTP Basic auth encrypts credentials.
+    // KokoroBox's local SOCKS5 endpoint does not require either method.
+    if ((username != NULL && username[0] != '\0') ||
+        (password != NULL && password[0] != '\0'))
+        return 0;
+
     if (resolve_hostname(proxy_ip) == 0)
         return 0;
 
@@ -72,8 +78,6 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     cfg->send_domain_to_proxy = send_domain_to_proxy;
     strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
     cfg->resolved_ip = resolve_hostname(proxy_ip);
-    if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
-    if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
     cfg->udp_tcp_ctrl  = INVALID_SOCKET;
     cfg->udp_send_sock = INVALID_SOCKET;
     cfg->udp_connected = FALSE;
@@ -86,6 +90,10 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
 PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password, BOOL send_domain_to_proxy)
 {
     if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
+        return FALSE;
+
+    if ((username != NULL && username[0] != '\0') ||
+        (password != NULL && password[0] != '\0'))
         return FALSE;
 
     UINT32 resolved = resolve_hostname(proxy_ip);
@@ -107,10 +115,6 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType typ
             cfg->send_domain_to_proxy = send_domain_to_proxy;
             strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
             cfg->resolved_ip = resolved;
-            cfg->username[0] = '\0';
-            cfg->password[0] = '\0';
-            if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
-            if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
 
             log_message("Edited proxy config ID %u: %s:%u (type %d)", config_id, cfg->host, cfg->port, cfg->type);
             return TRUE;
@@ -197,7 +201,7 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfig(UINT32 config_id, const char* ta
 
     int result;
     if (cfg->type == PROXY_TYPE_SOCKS5)
-        result = socks5_connect(sock, dest_ip, target_port, cfg);
+        result = socks5_connect(sock, dest_ip, target_port);
     else
         result = http_connect(sock, dest_ip, target_port, cfg);
 
@@ -228,11 +232,10 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* 
     if (target_port == 0) target_port = 80;
 
     BOOL is_socks = (cfg->type == PROXY_TYPE_SOCKS5);
-    BOOL use_auth = (cfg->username[0] != '\0');
 
     TLOG("Proxy:    %s:%u", cfg->host, cfg->port);
     TLOG("Protocol: %s", is_socks ? "SOCKS5" : "HTTP");
-    TLOG("Auth:     %s", use_auth ? "yes" : "no");
+    TLOG("Auth:     no");
     TLOG("Target:   %s:%u", target_host, target_port);
 
     UINT32 proxy_ip = resolve_hostname(cfg->host);
@@ -278,18 +281,16 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* 
     else
     {
         ULONGLONG h0 = GetTickCount64();
-        int rc = is_socks ? socks5_connect(s, dest_ip, target_port, cfg)
+        int rc = is_socks ? socks5_connect(s, dest_ip, target_port)
                           : http_connect(s, dest_ip, target_port, cfg);
         ULONGLONG h1 = GetTickCount64();
         if (rc != 0)
         {
             TLOG("  [FAIL] Could not establish a tunnel through the proxy (code %d)", rc);
-            if (use_auth) TLOG("  Hint: verify the proxy credentials");
             overall = -1;
         }
         else
         {
-            if (use_auth) TLOG("  Authentication was successful");
             TLOG("  Connection to %s:%u established through the proxy (%llu ms)", target_host, target_port, h1 - h0);
 
             // Try to load a default web page (best-effort; needs a web server on the target).
@@ -338,7 +339,7 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* 
             if (connect(us, (struct sockaddr*)&paddr, sizeof(paddr)) == 0)
             {
                 struct sockaddr_in relay; memset(&relay, 0, sizeof(relay));
-                int urc = socks5_udp_associate_with_config(us, &relay, cfg);
+                int urc = socks5_udp_associate_with_config(us, &relay);
                 if (urc == 0)
                 {
                     TLOG("  UDP ASSOCIATE granted; relay = %s:%u", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
@@ -357,4 +358,3 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* 
 
     #undef TLOG
 }
-

@@ -723,16 +723,16 @@ static DWORD connection_handler_impl(LPVOID arg)
         if (is_ipv6)
         {
             if (proxy->send_domain_to_proxy && dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port);
             else
-                rc = socks5_connect_v6(socks_sock, dest_ip6, dest_port, proxy);
+                rc = socks5_connect_v6(socks_sock, dest_ip6, dest_port);
         }
         else
         {
             if (proxy->send_domain_to_proxy && dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port);
             else
-                rc = socks5_connect(socks_sock, dest_ip, dest_port, proxy);
+                rc = socks5_connect(socks_sock, dest_ip, dest_port);
         }
         if (rc != 0)
         {
@@ -946,4 +946,3 @@ DWORD WINAPI transfer_handler(LPVOID arg)
 
     return 0;
 }
-

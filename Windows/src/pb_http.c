@@ -7,7 +7,6 @@ int http_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const 
     char request[HTTP_BUFFER_SIZE];
     char response[4096];
     int len;
-    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
 
     // Format IPv6 address as [addr]:port per RFC 2732
     char addr_str[64];
@@ -28,21 +27,9 @@ int http_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const 
         host_part = host_buf;
     }
 
-    if (use_auth)
-    {
-        char credentials[SOCKS5_BUFFER_SIZE], encoded[HTTP_BUFFER_SIZE];
-        snprintf(credentials, sizeof(credentials), "%s:%s", cfg->username, cfg->password);
-        base64_encode(credentials, encoded, sizeof(encoded));
-        len = snprintf(request, sizeof(request),
-            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Authorization: Basic %s\r\nProxy-Connection: keep-alive\r\n\r\n",
-            host_part, dest_port, host_part, dest_port, encoded);
-    }
-    else
-    {
-        len = snprintf(request, sizeof(request),
-            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: keep-alive\r\n\r\n",
-            host_part, dest_port, host_part, dest_port);
-    }
+    len = snprintf(request, sizeof(request),
+        "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: keep-alive\r\n\r\n",
+        host_part, dest_port, host_part, dest_port);
 
     if (send(s, request, len, 0) != len) return -1;
 
@@ -61,7 +48,6 @@ int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG 
     int len;
     char *status_line;
     int status_code;
-    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
 
     // Use the cached hostname only if this config opts to let the proxy resolve DNS.
     char cached_domain[256];
@@ -77,31 +63,12 @@ int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG 
         host_part = ip_str;
     }
 
-    if (use_auth)
-    {
-        // Create "username:password" string and encode as Base64
-        char credentials[SOCKS5_BUFFER_SIZE];
-        char encoded[HTTP_BUFFER_SIZE];
-        snprintf(credentials, sizeof(credentials), "%s:%s", cfg->username, cfg->password);
-        base64_encode(credentials, encoded, sizeof(encoded));
-
-        len = snprintf(request, sizeof(request),
-            "CONNECT %s:%d HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "Proxy-Authorization: Basic %s\r\n"
-            "Proxy-Connection: keep-alive\r\n"
-            "\r\n",
-            host_part, dest_port, host_part, dest_port, encoded);
-    }
-    else
-    {
-        len = snprintf(request, sizeof(request),
-            "CONNECT %s:%d HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "Proxy-Connection: keep-alive\r\n"
-            "\r\n",
-            host_part, dest_port, host_part, dest_port);
-    }
+    len = snprintf(request, sizeof(request),
+        "CONNECT %s:%d HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Proxy-Connection: keep-alive\r\n"
+        "\r\n",
+        host_part, dest_port, host_part, dest_port);
 
     if (send(s, request, len, 0) != len)
     {
@@ -137,4 +104,3 @@ int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG 
 
     return 0;
 }
-

@@ -47,7 +47,6 @@
 // 17 000 packets/sec a single core processes well over 200000 packets/sec.
 #define NUM_PACKET_THREADS 1
 #define CONNECTION_HASH_SIZE 4096
-#define SOCKS5_BUFFER_SIZE 1024
 #define HTTP_BUFFER_SIZE 1024
 #define FILTER_BUFFER_SIZE 1024
 #define LOG_BUFFER_SIZE 1024
@@ -186,8 +185,6 @@ typedef struct {
     ProxyType type;
     char host[256];
     UINT16 port;
-    char username[256];
-    char password[256];
     BOOL send_domain_to_proxy;  // TRUE = proxy resolves DNS (send hostname), FALSE = send IP
     UINT32 resolved_ip;         // cached at add/edit time - avoids DNS per connection
     ULONGLONG last_udp_attempt;
@@ -289,7 +286,6 @@ int send_all(SOCKET sock, const char *buf, int len);
 int recv_n(SOCKET s, char *buf, int n);
 UINT32 parse_ipv4(const char *ip);
 UINT32 resolve_hostname(const char *hostname);
-void base64_encode(const char* input, char* output, size_t output_size);
 
 // ---- pb_process.c ----
 void *pidtbl_reserve(DWORD need);
@@ -360,10 +356,10 @@ void flush_dns_resolver_cache(void);
 
 // ---- pb_socks5.c ----
 int socks5_read_connect_reply(SOCKET s, int *reply);
-int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg);
-int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
-int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg);
-int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg);
+int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port);
+int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port);
+int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port);
+int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr);
 BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg);
 
 // ---- pb_http.c ----

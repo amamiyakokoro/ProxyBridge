@@ -39,12 +39,14 @@ typedef enum {
 // proxy_ip can be IP address or hostname; returns config_id (>0) on success, 0 on failure
 // send_domain_to_proxy: TRUE = the proxy resolves DNS (send hostname; socks5h / CONNECT domain),
 //                       FALSE = resolve locally and send the IP (socks5 / CONNECT ip). Per-config.
+// Non-empty username/password values are rejected: proxy authentication would
+// transmit them in cleartext. KokoroBox uses a local unauthenticated SOCKS5 proxy.
 PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password, BOOL send_domain_to_proxy);
 PROXYBRIDGE_API BOOL   ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password, BOOL send_domain_to_proxy);
 PROXYBRIDGE_API BOOL   ProxyBridge_DeleteProxyConfig(UINT32 config_id);
 PROXYBRIDGE_API int    ProxyBridge_TestProxyConfig(UINT32 config_id, const char* target_host, UINT16 target_port, char* result_buffer, size_t buffer_size);
 // Detailed multi-step proxy check (like Proxifier's Proxy Checker). Streams human-readable
-// log lines through the callback: TCP reach, tunnel + auth, page load, latency, and - for
+// log lines through the callback: TCP reach, tunnel, page load, latency, and - for
 // SOCKS5 - a UDP ASSOCIATE probe. Returns 0 if the critical tests passed, negative otherwise.
 typedef void (*ProxyTestLogCallback)(const char* line, void* user);
 PROXYBRIDGE_API int    ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* target_host, UINT16 target_port, ProxyTestLogCallback callback, void* user);
