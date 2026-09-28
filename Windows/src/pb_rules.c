@@ -18,6 +18,19 @@ static void wait_for_owner_update(DWORD milliseconds)
         Sleep(milliseconds);
 }
 
+static BOOL is_loopback_v4(UINT32 ip)
+{
+    return (ntohl(ip) >> 24) == 127;
+}
+
+static BOOL is_loopback_v6(const UINT8 ip[16])
+{
+    static const UINT8 loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    static const UINT8 mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xFF,0xFF};
+    return memcmp(ip, loopback, sizeof(loopback)) == 0 ||
+           (memcmp(ip, mapped_prefix, sizeof(mapped_prefix)) == 0 && ip[12] == 127);
+}
+
 static DWORD resolve_process_owner_v4(UINT32 src_ip, UINT16 src_port,
                                       UINT32 dest_ip, UINT16 dest_port, BOOL is_udp)
 {
@@ -91,6 +104,13 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
 {
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
+
+    if (out_pid) *out_pid = 0;
+    if (out_proxy_config_id) *out_proxy_config_id = 0;
+    // Local IPC and kernel-generated replies may have no surviving process owner.
+    // This explicit managed exclusion must run before the bounded owner wait.
+    if (g_loopback_bypass_enabled && is_loopback_v6(src_ip6) && is_loopback_v6(dest_ip6))
+        return RULE_ACTION_DIRECT;
 
     pid = resolve_process_owner_v6(src_ip6, src_port, dest_ip6, dest_port, is_udp);
     if (out_pid) *out_pid = pid;
@@ -812,6 +832,11 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
 {
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
+
+    if (out_pid) *out_pid = 0;
+    if (out_proxy_config_id) *out_proxy_config_id = 0;
+    if (g_loopback_bypass_enabled && is_loopback_v4(src_ip) && is_loopback_v4(dest_ip))
+        return RULE_ACTION_DIRECT;
 
     pid = resolve_process_owner_v4(src_ip, src_port, dest_ip, dest_port, is_udp);
     if (out_pid != NULL)

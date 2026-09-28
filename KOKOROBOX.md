@@ -4,9 +4,10 @@ KokoroBox Desktop pins this independently maintained repository at an exact comm
 
 ## Windows
 
-KokoroBox builds `ProxyBridgeCore.dll` for Windows x64. The core includes three integration changes:
+KokoroBox builds `ProxyBridgeCore.dll` for Windows x64. The core includes these integration changes:
 
 - A `PROXY` rule resolves to `BLOCK` when its proxy configuration is missing, invalid, or incompatible with UDP. It never falls back to `DIRECT`.
+- Managed routing explicitly bypasses IPv4, IPv6, and IPv4-mapped loopback traffic before owner lookup. This keeps ownerless local replies from delaying other packets; external traffic retains fail-closed handling. The bypass is opt-in and does not skip relay translation.
 - An explicit API controls whether an application's UDP/53 DNS queries participate in `PROXY` rules, including TCP-only rules. Other UDP traffic is unaffected.
 - `MAX_PROCESS_NAME` is 65536 bytes, allowing the controlled router to guard a bounded list of canonical executable paths during atomic rule replacement.
 

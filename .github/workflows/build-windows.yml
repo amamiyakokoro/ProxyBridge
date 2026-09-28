@@ -21,6 +21,9 @@ jobs:
           Invoke-WebRequest https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip -OutFile WinDivert.zip
           if ((Get-FileHash WinDivert.zip -Algorithm SHA256).Hash -ne '63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15') { throw 'WinDivert archive hash mismatch' }
           Expand-Archive WinDivert.zip -DestinationPath C:\
+      - name: Test ownerless loopback routing
+        shell: pwsh
+        run: Windows\test-loopback.ps1
       - name: Build core
         shell: pwsh
         run: Windows\compile.ps1
