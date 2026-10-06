@@ -24,3 +24,22 @@ KokoroBox uses the `NETransparentProxyProvider` system extension. Its controlled
 - KokoroBox, its helper and extension, Mihomo, loopback, link-local, multicast, and broadcast traffic are excluded to prevent routing loops.
 
 This repository does not include the standalone ProxyBridge GUI, updater, or macOS DNS proxy provider. See the [Windows](Windows/README.md) and [macOS](MacOS/README.md) component guides for build details.
+
+## macOS routing logs
+
+The provider keeps activity and connection entries in a 500-entry in-memory ring.
+`getLogs` drains up to 100 entries and returns a JSON array (including an empty
+array when there are no entries). `clearLogs` atomically empties the ring and
+acknowledges with `{ "status": "ok" }`. These actions use the existing
+NetworkExtension provider-message channel.
+
+KokoroBox TCP decisions record the application, destination, port and
+Proxy/Direct/Block result. UDP proxy records retain their existing per-destination
+deduplication; UDP Direct/Block decisions have unknown destinations because those
+flows are not opened for inspection. Connection records include an ISO 8601
+`timestamp` and obey `diagnosticLogging`. Activity/error records remain available
+independently of the traffic switch. Excluded local-network traffic is not logged.
+Logs are not persisted and disappear when the provider process exits.
+
+Run `sh MacOS/tests/routing-logs.sh` on macOS to check ring capacity, batched reads,
+clear, connection timestamps and concurrent access without activating an extension.

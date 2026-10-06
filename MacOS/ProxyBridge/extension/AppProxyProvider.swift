@@ -317,6 +317,69 @@ private enum KokoroBoxConfigurationError: LocalizedError {
     }
 }
 
+// one log entry, kept as an enum so we don't allocate a dictionary per line,
+// the dict is only built when the gui drains a batch
+private enum RoutingLogEntry {
+    case connection(timestamp: String, proto: String, process: String, destination: String, port: String, proxy: String)
+    case activity(timestamp: String, level: String, message: String)
+
+    func toDict() -> [String: String] {
+        switch self {
+        case let .connection(timestamp, proto, process, destination, port, proxy):
+            return ["type": "connection", "timestamp": timestamp, "protocol": proto, "process": process,
+                    "destination": destination, "port": port, "proxy": proxy]
+        case let .activity(timestamp, level, message):
+            return ["type": "activity", "timestamp": timestamp, "level": level, "message": message]
+        }
+    }
+}
+
+// Circular buffer shared by activity and connection logs. Reads drain a bounded batch atomically.
+private final class RoutingLogBuffer {
+    private static let capacity = 500
+    private var entries = [RoutingLogEntry?](repeating: nil, count: capacity)
+    private var head = 0
+    private var tail = 0
+    private var count = 0
+    private let lock = NSLock()
+
+    func append(_ entry: RoutingLogEntry) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[tail] = entry
+        tail = (tail + 1) % Self.capacity
+        if count < Self.capacity {
+            count += 1
+        } else {
+            head = (head + 1) % Self.capacity
+        }
+    }
+
+    func drain() -> [[String: String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        let batchSize = min(100, count)
+        var batch: [[String: String]] = []
+        batch.reserveCapacity(batchSize)
+        for _ in 0..<batchSize {
+            if let entry = entries[head] { batch.append(entry.toDict()) }
+            entries[head] = nil
+            head = (head + 1) % Self.capacity
+            count -= 1
+        }
+        return batch
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        entries = [RoutingLogEntry?](repeating: nil, count: Self.capacity)
+        head = 0
+        tail = 0
+        count = 0
+    }
+}
+
 class AppProxyProvider: NETransparentProxyProvider {
     private static let kokoroBoxAppGroup = "group.com.amamiyakokoro.app"
     private static let kokoroBoxPolicyNotification =
@@ -325,25 +388,6 @@ class AppProxyProvider: NETransparentProxyProvider {
     private static let kokoroBoxPolicyAcknowledgementFilename =
         "application-routing-policy-ack.json"
     
-    // one log entry, kept as an enum so we don't allocate a dictionary per line,
-    // the dict is only built when the gui drains a batch
-    private enum LogEntry {
-        case connection(proto: String, process: String, destination: String, port: String, proxy: String)
-        case activity(timestamp: String, level: String, message: String)
-
-        func toDict() -> [String: String] {
-            switch self {
-            case let .connection(proto, process, destination, port, proxy):
-                return ["type": "connection", "protocol": proto, "process": process,
-                        "destination": destination, "port": port, "proxy": proxy]
-            case let .activity(timestamp, level, message):
-                return ["type": "activity", "timestamp": timestamp, "level": level, "message": message]
-            }
-        }
-    }
-
-    // circular buffer for logs, avoids shifting the whole array on every pop
-    private static let logCapacity = 500
     private static let kokoroBoxExcludedNetworkRules: [NENetworkRule] = [
         ("127.0.0.0", 8),
         ("169.254.0.0", 16),
@@ -362,11 +406,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             direction: .outbound
         )
     }
-    private var logBuffer = [LogEntry?](repeating: nil, count: AppProxyProvider.logCapacity)
-    private var logHead = 0
-    private var logTail = 0
-    private var logCount = 0
-    private let logQueueLock = NSLock()
+    private let routingLogs = RoutingLogBuffer()
     private let dateFormatter: ISO8601DateFormatter = ISO8601DateFormatter()
     
     // cache by pid so we don't call proc_pidpath on every connection
@@ -690,17 +730,8 @@ class AppProxyProvider: NETransparentProxyProvider {
         appendLog(.activity(timestamp: dateFormatter.string(from: Date()), level: level, message: message))
     }
 
-    private func appendLog(_ entry: LogEntry) {
-        logQueueLock.lock()
-        logBuffer[logTail] = entry
-        logTail = (logTail + 1) % AppProxyProvider.logCapacity
-        if logCount < AppProxyProvider.logCapacity {
-            logCount += 1
-        } else {
-            // buffer full, bump head to drop the oldest entry
-            logHead = (logHead + 1) % AppProxyProvider.logCapacity
-        }
-        logQueueLock.unlock()
+    private func appendLog(_ entry: RoutingLogEntry) {
+        routingLogs.append(entry)
     }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
@@ -840,25 +871,10 @@ class AppProxyProvider: NETransparentProxyProvider {
                 "ruleCount": configuration?.rules.count ?? 0
             ]))
         case "getLogs":
-            logQueueLock.lock()
-            if logCount > 0 {
-                let batchSize = min(100, logCount)
-                var logsToSend: [[String: String]] = []
-                logsToSend.reserveCapacity(batchSize)
-                for _ in 0..<batchSize {
-                    if let entry = logBuffer[logHead] {
-                        logsToSend.append(entry.toDict())
-                    }
-                    logBuffer[logHead] = nil  // release the drained entry
-                    logHead = (logHead + 1) % AppProxyProvider.logCapacity
-                    logCount -= 1
-                }
-                logQueueLock.unlock()
-                completionHandler?(try? JSONSerialization.data(withJSONObject: logsToSend))
-            } else {
-                logQueueLock.unlock()
-                completionHandler?(nil)
-            }
+            completionHandler?(try? JSONSerialization.data(withJSONObject: routingLogs.drain()))
+        case "clearLogs":
+            routingLogs.clear()
+            completionHandler?(try? JSONSerialization.data(withJSONObject: ["status": "ok"]))
         case "setTrafficLogging":
             if let enabled = message["enabled"] as? Bool {
                 trafficLoggingEnabled = enabled
@@ -979,12 +995,15 @@ class AppProxyProvider: NETransparentProxyProvider {
                 connectionProtocol: .tcp
             ) {
             case .direct, .none:
+                sendLogToApp(protocol: "TCP", process: processName ?? processPath, destination: destination, port: portStr, proxy: "Direct")
                 return false
             case .block:
+                sendLogToApp(protocol: "TCP", process: processName ?? processPath, destination: destination, port: portStr, proxy: "BLOCK")
                 flow.closeReadWithError(nil)
                 flow.closeWriteWithError(nil)
                 return true
             case .proxy(let configuration):
+                sendLogToApp(protocol: "TCP", process: processName ?? processPath, destination: destination, port: portStr, proxy: proxyLabel(configuration))
                 proxyTCPFlow(flow, destination: destination, port: portNum, config: configuration)
                 return true
             }
@@ -1055,8 +1074,10 @@ class AppProxyProvider: NETransparentProxyProvider {
                 connectionProtocol: .udp
             ) {
             case .direct, .none:
+                sendLogToApp(protocol: "UDP", process: displayName, destination: "unknown", port: "unknown", proxy: "Direct")
                 return false
             case .block:
+                sendLogToApp(protocol: "UDP", process: displayName, destination: "unknown", port: "unknown", proxy: "BLOCK")
                 return true
             case .proxy(let configuration):
                 flow.open(withLocalEndpoint: nil) { [weak self] error in
@@ -1971,6 +1992,6 @@ class AppProxyProvider: NETransparentProxyProvider {
     
     private func sendLogToApp(protocol: String, process: String, destination: String, port: String, proxy: String) {
         guard trafficLoggingEnabled else { return }
-        appendLog(.connection(proto: `protocol`, process: process, destination: destination, port: port, proxy: proxy))
+        appendLog(.connection(timestamp: ISO8601DateFormatter().string(from: Date()), proto: `protocol`, process: process, destination: destination, port: port, proxy: proxy))
     }
 }
