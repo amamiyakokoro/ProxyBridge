@@ -54,6 +54,7 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->fin_flags = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -100,6 +101,7 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->fin_flags = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -292,6 +294,21 @@ void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
     ReleaseSRWLockExclusive(&lock);
 }
 
+void connection_fin(UINT16 src_port, BOOL is_ipv6, UINT8 bit)
+{
+    AcquireSRWLockExclusive(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[src_port % CONNECTION_HASH_SIZE]; c; c = c->next)
+    {
+        if (c->src_port == src_port && !c->is_udp && c->is_ipv6 == is_ipv6)
+        {
+            c->fin_flags |= bit;
+            c->last_activity = GetTickCount64();
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
 void cleanup_stale_connections(void)
 {
     ULONGLONG now = GetTickCount64();
@@ -303,7 +320,8 @@ void cleanup_stale_connections(void)
 
         while (*conn_ptr != NULL)
         {
-            if (now - (*conn_ptr)->last_activity > CONNECTION_STALE_TIMEOUT_MS)
+            ULONGLONG timeout = (*conn_ptr)->fin_flags == 3 ? 60000 : CONNECTION_STALE_TIMEOUT_MS;
+            if (now - (*conn_ptr)->last_activity > timeout)
             {
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;

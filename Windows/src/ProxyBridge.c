@@ -94,6 +94,29 @@ ConnectionCallback g_connection_callback = NULL;
 char  *g_pidtbl_buf = NULL;
 DWORD  g_pidtbl_cap = 0;
 
+static BOOL is_proxy_server_endpoint(UINT32 destination, UINT16 port)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+        if (g_proxy_configs[i].config_id && g_proxy_configs[i].resolved_ip == destination &&
+            g_proxy_configs[i].port == port)
+            return TRUE;
+    return FALSE;
+}
+
+static void reset_stale_tcp_state(UINT16 source_port, BOOL ipv6)
+{
+    if (source_port == g_local_relay_port) return;
+    remove_connection(source_port, FALSE, ipv6);
+    port_clear(source_port);
+}
+
+static BOOL consume_direct_decision(UINT16 source_port, BOOL teardown)
+{
+    BOOL direct = port_is_decided(source_port) && port_is_direct(source_port);
+    if (teardown) port_clear(source_port);
+    return direct;
+}
+
 static void owner_address_to_network_bytes(const UINT32 address[4], UINT8 output[16])
 {
     UINT32 network_order[4];
@@ -298,6 +321,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
     #define WinDivertSend(handle, packet_ptr, length, sent, address) \
         queue_packet_for_send(&send_batch, packet_ptr, length, address)
 
+    DWORD receive_failures = 0;
     while (running)
     {
         UINT recv_len = 0;
@@ -310,9 +334,16 @@ DWORD WINAPI packet_processor(LPVOID arg)
             if (error == ERROR_INVALID_HANDLE || error == ERROR_NO_DATA ||
                 error == ERROR_OPERATION_ABORTED)
                 break;
-            log_message("Failed to receive packet batch (%lu)", error);
+            receive_failures++;
+            if (receive_failures == 1 || receive_failures % 1000 == 0)
+                log_message("Failed to receive packet batch (%lu), %lu consecutive failures", error, receive_failures);
+            if (receive_failures == 5000)
+                log_message("Packet capture keeps failing; restart the routing engine");
+            if (receive_failures > 10 && shutdown_event != NULL)
+                WaitForSingleObject(shutdown_event, receive_failures > 1000 ? 100 : 5);
             continue;
         }
+        receive_failures = 0;
 
         UINT packet_count = addr_len / sizeof(WINDIVERT_ADDRESS);
         UINT8 *packet = recv_packets;
@@ -520,13 +551,12 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 // bitmaps are shared by both stacks: a verdict cached for an IPv4
                 // connection must not be inherited by a new IPv6 connection that
                 // happens to reuse the port number, or vice versa.
-                if (tcp_header->Syn && !tcp_header->Ack && port_is_decided(sp))
-                    port_clear(sp);
+                if (tcp_header->Syn && !tcp_header->Ack)
+                    reset_stale_tcp_state(sp, TRUE);
 
                 if (port_is_decided(sp))
                 {
-                    if (tcp_header->Fin || tcp_header->Rst) port_clear(sp);
-                    if (port_is_direct(sp))
+                    if (consume_direct_decision(sp, tcp_header->Fin || tcp_header->Rst))
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
@@ -554,13 +584,15 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         memcpy(ipv6_header->SrcAddr, tmp, 16);
                         addr.Outbound = FALSE;
                     }
-                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(client_sp, FALSE, TRUE);
+                    if (tcp_header->Rst) remove_connection(client_sp, FALSE, TRUE);
+                    else if (tcp_header->Fin) connection_fin(client_sp, TRUE, 2);
                     goto ipv6_send;
                 }
 
                 if (is_connection_tracked(sp, FALSE, TRUE))
                 {
-                    if (tcp_header->Fin || tcp_header->Rst) { remove_connection(sp, FALSE, TRUE); port_clear(sp); }
+                    if (tcp_header->Rst) { remove_connection(sp, FALSE, TRUE); port_clear(sp); }
+                    else if (tcp_header->Fin) connection_fin(sp, TRUE, 1);
                     tcp_header->DstPort = htons(g_local_relay_port);
 
                     static const UINT8 _lb6t[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -575,6 +607,12 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         addr.Outbound = FALSE;
                     }
                     goto ipv6_send;
+                }
+
+                if (tcp_header->Fin || tcp_header->Rst)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
                 }
 
                 // skip multicast/link-local
@@ -912,6 +950,13 @@ DWORD WINAPI packet_processor(LPVOID arg)
             {
                 UINT16 sp = ntohs(tcp_header->SrcPort);
 
+                if (sp != g_local_relay_port &&
+                    is_proxy_server_endpoint(ip_header->DstAddr, ntohs(tcp_header->DstPort)))
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
                 // A fresh SYN starts a new connection that may be reusing an ephemeral
                 // port whose previous owner has closed. Evict any PID cached for this
                 // port so the rule decision is re-derived against the correct current
@@ -921,22 +966,12 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     remove_cached_pid(ip_header->SrcAddr, sp, FALSE);
 
-                    // The cached rule decision belongs to the previous owner of this
-                    // port and has to go with it. FIN/RST is not a reliable eviction
-                    // trigger: server-initiated closes arrive on the inbound branch and
-                    // loopback/abortive teardowns never show up here at all, so a
-                    // DIRECT verdict can outlive the connection that produced it. The
-                    // next connection reusing the port would then hit the fast-path
-                    // above and go out unproxied without its own rule ever running.
-                    if (port_is_decided(sp))
-                        port_clear(sp);
+                    reset_stale_tcp_state(sp, FALSE);
                 }
 
                 if (port_is_decided(sp))
                 {
-                    if (tcp_header->Fin || tcp_header->Rst)
-                        port_clear(sp);
-                    if (port_is_direct(sp))
+                    if (consume_direct_decision(sp, tcp_header->Fin || tcp_header->Rst))
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
@@ -968,18 +1003,22 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     addr.Outbound = FALSE;
                 }
 
-                if (tcp_header->Fin || tcp_header->Rst)
+                if (tcp_header->Rst)
                     remove_connection(dst_port, FALSE, FALSE);
+                else if (tcp_header->Fin)
+                    connection_fin(dst_port, FALSE, 2);
             }
             else if (is_connection_tracked(ntohs(tcp_header->SrcPort), FALSE, FALSE))
             {
                 UINT16 src_port = ntohs(tcp_header->SrcPort);
 
-                if (tcp_header->Fin || tcp_header->Rst)
+                if (tcp_header->Rst)
                 {
                     remove_connection(src_port, FALSE, FALSE);
                     port_clear(src_port);
                 }
+                else if (tcp_header->Fin)
+                    connection_fin(src_port, FALSE, 1);
 
                 tcp_header->DstPort = htons(g_local_relay_port);
 
@@ -1002,6 +1041,12 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 UINT32 src_ip = ip_header->SrcAddr;
                 UINT32 orig_dest_ip = ip_header->DstAddr;
                 UINT16 orig_dest_port = ntohs(tcp_header->DstPort);
+
+                if (tcp_header->Fin || tcp_header->Rst)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
 
                 // avoid rule pocess and packet process if no rules
                 if (!g_has_active_rules && g_connection_callback == NULL)
