@@ -30,6 +30,58 @@ int socks5_read_connect_reply(SOCKET s, int *reply)
     return 0;
 }
 
+// Explains a failed CONNECT. reply == -1 means no reply was read at all (the proxy closed the
+// connection or timed out during the handshake); otherwise it is the RFC 1928 REP code.
+// Identical messages repeat in bursts (a browser retrying a destination the proxy cannot
+// reach), so the same line is collapsed for a few seconds instead of flooding the log.
+static void socks5_log_connect_failure(const char *kind, const char *dest, UINT16 port, int reply)
+{
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static char last[512];
+    static ULONGLONG last_tick = 0;
+    static int suppressed = 0;
+
+    char why[160];
+    if (reply < 0)
+        snprintf(why, sizeof(why), "the proxy closed the connection or did not answer (it may be unable to reach this destination)");
+    else
+    {
+        const char *t = "unknown error";
+        switch (reply)
+        {
+            case 0x01: t = "general failure"; break;
+            case 0x02: t = "not allowed by ruleset"; break;
+            case 0x03: t = "network unreachable"; break;
+            case 0x04: t = "host unreachable"; break;
+            case 0x05: t = "connection refused"; break;
+            case 0x06: t = "TTL expired"; break;
+            case 0x07: t = "command not supported"; break;
+            case 0x08: t = "address type not supported"; break;
+        }
+        snprintf(why, sizeof(why), "proxy replied 0x%02X (%s)", reply, t);
+    }
+
+    char line[512];
+    snprintf(line, sizeof(line), "SOCKS5 %s: CONNECT to %s:%u failed - %s", kind, dest, (unsigned)port, why);
+
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&lk);
+    if (strcmp(line, last) == 0 && now - last_tick < 5000)
+    {
+        suppressed++;
+        ReleaseSRWLockExclusive(&lk);
+        return;
+    }
+    int n = suppressed;
+    suppressed = 0;
+    strncpy_s(last, sizeof(last), line, _TRUNCATE);
+    last_tick = now;
+    ReleaseSRWLockExclusive(&lk);
+
+    if (n > 0) log_message("(previous SOCKS5 failure repeated %d more times)", n);
+    log_message("%s", line);
+}
+
 // KokoroBox uses an unauthenticated local SOCKS5 endpoint. Never negotiate
 // RFC 1929 username/password authentication over a cleartext TCP connection.
 static int socks5_negotiate_no_auth(SOCKET s)
@@ -49,7 +101,7 @@ static int socks5_negotiate_no_auth(SOCKET s)
 int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port)
 {
     unsigned char request[7 + 255];
-    size_t hlen = strnlen_s(hostname, 255);
+    size_t hlen = strnlen_s(hostname, 256);
     if (hlen == 0 || hlen > 255 || socks5_negotiate_no_auth(s) != 0)
         return -1;
 
@@ -68,7 +120,7 @@ int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port)
     int reply;
     if (socks5_read_connect_reply(s, &reply) != 0)
     {
-        log_message("SOCKS5 domain: CONNECT failed (reply=%d)", reply);
+        socks5_log_connect_failure("domain", hostname, dest_port, reply);
         return -1;
     }
     return 0;
@@ -103,7 +155,9 @@ int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
     int reply;
     if (socks5_read_connect_reply(s, &reply) != 0)
     {
-        log_message("SOCKS5: CONNECT failed (reply=%d)", reply);
+        char destination[32];
+        format_ip_address(dest_ip, destination, sizeof(destination));
+        socks5_log_connect_failure("IPv4", destination, dest_port, reply);
         return -1;
     }
     return 0;
@@ -128,7 +182,9 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port)
     int reply;
     if (socks5_read_connect_reply(s, &reply) != 0)
     {
-        log_message("SOCKS5 IPv6: CONNECT failed (reply=%d)", reply);
+        char destination[64] = "?";
+        InetNtopA(AF_INET6, dest_ip6, destination, sizeof(destination));
+        socks5_log_connect_failure("IPv6", destination, dest_port, reply);
         return -1;
     }
     return 0;

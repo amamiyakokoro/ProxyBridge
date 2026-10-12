@@ -671,6 +671,13 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
     return 0;
 }
 
+static void reset_close(SOCKET socket)
+{
+    struct linger abortive = {1, 0};
+    setsockopt(socket, SOL_SOCKET, SO_LINGER, (const char *)&abortive, sizeof(abortive));
+    closesocket(socket);
+}
+
 static DWORD connection_handler_impl(LPVOID arg)
 {
     CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)arg;
@@ -728,7 +735,7 @@ static DWORD connection_handler_impl(LPVOID arg)
     if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
     {
         log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
-        closesocket(client_sock);
+        reset_close(client_sock);
         closesocket(socks_sock);
         return 0;
     }
@@ -755,7 +762,7 @@ static DWORD connection_handler_impl(LPVOID arg)
         }
         if (rc != 0)
         {
-            closesocket(client_sock);
+            reset_close(client_sock);
             closesocket(socks_sock);
             return 0;
         }
@@ -767,7 +774,7 @@ static DWORD connection_handler_impl(LPVOID arg)
             : http_connect(socks_sock, dest_ip, dest_port, proxy);
         if (rc != 0)
         {
-            closesocket(client_sock);
+            reset_close(client_sock);
             closesocket(socks_sock);
             return 0;
         }
