@@ -402,6 +402,11 @@ DWORD WINAPI connection_handler(LPVOID arg);
 DWORD WINAPI one_way_relay(LPVOID arg);
 DWORD WINAPI transfer_handler(LPVOID arg);
 void abort_active_relays(void);
+extern volatile LONG g_active_relays;
+BOOL relay_pool_start(void);
+void relay_pool_abort(void);
+void relay_pool_stop(void);
+BOOL relay_start(SOCKET client, SOCKET proxy);
 
 // ---- ProxyBridge.c ----
 DWORD WINAPI packet_processor(LPVOID arg);

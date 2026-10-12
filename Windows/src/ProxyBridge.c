@@ -1399,6 +1399,7 @@ static void wait_for_runtime_workers(void)
     // worker can now drain before shared state is released.
     if (connection_workers_done_event != NULL)
         WaitForSingleObject(connection_workers_done_event, INFINITE);
+    relay_pool_stop();
 }
 
 // Dedicated cleanup thread - runs independently without blocking packet processing
@@ -1438,6 +1439,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     if (!create_lifecycle_events())
         return FALSE;
     running = TRUE;
+    if (!relay_pool_start())
+        log_message("IOCP relay pool unavailable; using blocking relay workers");
 
     if (!start_owner_observers(priority))
         goto start_failed;

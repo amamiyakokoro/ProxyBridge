@@ -75,6 +75,7 @@ static void unregister_relay_pair(RELAY_PAIR *pair)
 
 void abort_active_relays(void)
 {
+    relay_pool_abort();
     int count = 0;
     AcquireSRWLockShared(&relay_pairs_lock);
     for (RELAY_PAIR *pair = active_relay_pairs; pair != NULL; pair = pair->next)
@@ -724,8 +725,9 @@ static DWORD connection_handler_impl(LPVOID arg)
     // the proxy's receive window fills up, which stalls the relay loop and
     // triggers TCP flow-control on the client side → massive upload throughput
     // loss.  4 MB gives plenty of headroom even at high bitrates / high RTT.
-    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB – proxy connection
-    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB – app connection
+    int socket_buffer = g_active_relays < 1024 ? 4194304 : 1048576;
+    configure_tcp_socket(socks_sock, socket_buffer, 30000);
+    configure_tcp_socket(client_sock, socket_buffer, 30000);
 
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
@@ -909,6 +911,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     SOCKET sock_client = config->from_socket;
     SOCKET sock_proxy  = config->to_socket;
     free(config);
+    if (relay_start(sock_client, sock_proxy)) return 0;
 
     RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
     if (!pair)
@@ -971,4 +974,259 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     CloseHandle(upload_thread);
 
     return 0;
+}
+
+// ============================================================================================
+// IOCP relay pool
+//
+// The data-transfer stage used to run two blocking threads (upload + download) and two 128 KB
+// buffers for every proxied connection. A BitTorrent-style workload with a thousand peers meant
+// 2,000+ threads, ~350 KB and ~9 handles per connection (issue #213: "over 1000 threads, machine
+// sluggish despite low CPU"). Here a fixed pool of worker threads drives overlapped WSARecv /
+// WSASend through an I/O completion port, so thread count no longer grows with connections.
+//
+// Memory also tracks *active* transfers, not open connections: an idle direction waits with a
+// zero-byte receive (completes when data or a close is pending) and holds no buffer. When data
+// arrives it takes a 64 KB buffer from a shared pool, reads, sends, and goes back to waiting
+// unless the stream is still busy (then it keeps the buffer for the next read). Shrinking the
+// per-connection buffer instead made fast transfers slow under load (measured), so buffers stay
+// full size and only busy directions own one.
+//
+// Clean EOF closes only the destination send side so reverse responses can drain.
+// Errors and engine shutdown abort both directions; the last completion closes the sockets.
+// The blocking one_way_relay/transfer_handler path stays as the fallback if the pool cannot start.
+// ============================================================================================
+#define RELAY_BUF_SIZE   65536
+#define RELAY_POOL_KEEP  256            // free buffers kept for reuse; more are freed
+
+enum { RS_WAIT = 0, RS_READ, RS_SEND };
+
+typedef struct RELAY_CONN RELAY_CONN;
+typedef struct {
+    OVERLAPPED  ov;          // must stay first: the completion hands back &ov
+    RELAY_CONN *rc;
+    SOCKET      src, dst;
+    char       *buf;         // NULL while waiting
+    DWORD       len, off;
+    int         state;
+} RELAY_DIR;
+struct RELAY_CONN {
+    SOCKET        s[2];
+    RELAY_DIR     dir[2];
+    volatile LONG refs;      // directions still alive
+    volatile LONG closing;
+    RELAY_CONN   *prev, *next;
+};
+
+volatile LONG g_active_relays = 0;
+static HANDLE            g_iocp = NULL;
+static HANDLE            g_relay_workers[16];
+static int               g_relay_nworkers = 0;
+static SRWLOCK           g_relay_lock = SRWLOCK_INIT;
+static BOOL              g_relay_accepting = FALSE;
+static HANDLE            g_relay_done = NULL;
+static RELAY_CONN       *g_relay_head = NULL;
+static char             *g_relay_pool[RELAY_POOL_KEEP];
+static int               g_relay_pool_n = 0;       // guarded by g_relay_lock
+
+static char *relay_buf_get(void)
+{
+    char *b = NULL;
+    AcquireSRWLockExclusive(&g_relay_lock);
+    if (g_relay_pool_n > 0) b = g_relay_pool[--g_relay_pool_n];
+    ReleaseSRWLockExclusive(&g_relay_lock);
+    return b ? b : (char *)malloc(RELAY_BUF_SIZE);
+}
+
+static void relay_buf_put(char *b)
+{
+    if (b == NULL) return;
+    AcquireSRWLockExclusive(&g_relay_lock);
+    if (g_relay_pool_n < RELAY_POOL_KEEP) { g_relay_pool[g_relay_pool_n++] = b; b = NULL; }
+    ReleaseSRWLockExclusive(&g_relay_lock);
+    free(b);
+}
+
+static void relay_abort(RELAY_CONN *rc)
+{
+    if (InterlockedCompareExchange(&rc->closing, 1, 0) == 0)
+    {
+        shutdown(rc->s[0], SD_BOTH);
+        shutdown(rc->s[1], SD_BOTH);
+        CancelIoEx((HANDLE)rc->s[0], NULL);      // completes the sibling's pending recv/send with an error
+        CancelIoEx((HANDLE)rc->s[1], NULL);
+    }
+}
+
+static void relay_release(RELAY_CONN *rc)
+{
+    if (InterlockedDecrement(&rc->refs) != 0) return;
+    AcquireSRWLockExclusive(&g_relay_lock);
+    if (rc->prev) rc->prev->next = rc->next; else g_relay_head = rc->next;
+    if (rc->next) rc->next->prev = rc->prev;
+    if (InterlockedDecrement(&g_active_relays) == 0) SetEvent(g_relay_done);
+    ReleaseSRWLockExclusive(&g_relay_lock);
+    closesocket(rc->s[0]);
+    closesocket(rc->s[1]);
+    relay_buf_put(rc->dir[0].buf);
+    relay_buf_put(rc->dir[1].buf);
+    free(rc);
+}
+
+static void relay_dir_end(RELAY_DIR *d, BOOL clean_eof)
+{
+    RELAY_CONN *rc = d->rc;
+    if (clean_eof) shutdown(d->dst, SD_SEND);
+    else relay_abort(rc);
+    relay_release(rc);
+}
+
+static BOOL relay_io_ok(int rc_, int err) { return !(rc_ == SOCKET_ERROR && err != WSA_IO_PENDING); }
+
+// Idle: give the buffer back and wait for readability with a zero-byte receive.
+static BOOL relay_post_wait(RELAY_DIR *d)
+{
+    relay_buf_put(d->buf); d->buf = NULL;
+    static char dummy;
+    WSABUF wb; wb.len = 0; wb.buf = &dummy;
+    DWORD flags = 0;
+    ZeroMemory(&d->ov, sizeof(d->ov));
+    d->state = RS_WAIT;
+    int r = WSARecv(d->src, &wb, 1, NULL, &flags, &d->ov, NULL);
+    return relay_io_ok(r, r == SOCKET_ERROR ? WSAGetLastError() : 0);
+}
+
+// Data is (or was) available: read it into the direction's buffer.
+static BOOL relay_post_read(RELAY_DIR *d)
+{
+    if (d->buf == NULL && (d->buf = relay_buf_get()) == NULL) return FALSE;
+    WSABUF wb; wb.len = RELAY_BUF_SIZE; wb.buf = d->buf;
+    DWORD flags = 0;
+    ZeroMemory(&d->ov, sizeof(d->ov));
+    d->state = RS_READ;
+    int r = WSARecv(d->src, &wb, 1, NULL, &flags, &d->ov, NULL);
+    return relay_io_ok(r, r == SOCKET_ERROR ? WSAGetLastError() : 0);
+}
+
+static BOOL relay_post_send(RELAY_DIR *d)
+{
+    WSABUF wb; wb.len = d->len - d->off; wb.buf = d->buf + d->off;
+    ZeroMemory(&d->ov, sizeof(d->ov));
+    d->state = RS_SEND;
+    int r = WSASend(d->dst, &wb, 1, NULL, 0, &d->ov, NULL);
+    return relay_io_ok(r, r == SOCKET_ERROR ? WSAGetLastError() : 0);
+}
+
+static DWORD WINAPI relay_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        DWORD n = 0; ULONG_PTR key = 0; OVERLAPPED *ov = NULL;
+        BOOL ok = GetQueuedCompletionStatus(g_iocp, &n, &key, &ov, INFINITE);
+        if (ov == NULL) break;                         // exit signal (or the port itself failed)
+        RELAY_DIR *d = (RELAY_DIR *)ov;
+        if (!ok) { relay_dir_end(d, FALSE); continue; }       // error / aborted
+        BOOL posted = TRUE;
+        switch (d->state)
+        {
+        case RS_WAIT:                                  // data or a close is pending: read it for real
+            posted = relay_post_read(d);
+            break;
+        case RS_READ:
+            if (n == 0) { relay_dir_end(d, TRUE); continue; }   // preserve the reverse direction
+            d->len = n; d->off = 0;
+            posted = relay_post_send(d);
+            break;
+        default:                                       // RS_SEND
+            if (n == 0) { relay_dir_end(d, FALSE); continue; }
+            d->off += n;
+            if (d->off < d->len) posted = relay_post_send(d);
+            else if (d->len < RELAY_BUF_SIZE / 4) posted = relay_post_wait(d);   // lightly used: drop the buffer
+            else posted = relay_post_read(d);                                    // streaming: keep it
+            break;
+        }
+        if (!posted) relay_dir_end(d, FALSE);
+    }
+    return 0;
+}
+
+BOOL relay_pool_start(void)
+{
+    if (g_iocp != NULL) return TRUE;
+    g_relay_done = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (g_relay_done == NULL) return FALSE;
+    g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (g_iocp == NULL) { CloseHandle(g_relay_done); g_relay_done = NULL; return FALSE; }
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors / 2;
+    if (n < 2) n = 2;
+    if (n > 8) n = 8;
+    g_relay_nworkers = 0;
+    for (int i = 0; i < n; i++)
+    {
+        g_relay_workers[g_relay_nworkers] = CreateThread(NULL, 0, relay_worker, NULL, 0, NULL);
+        if (g_relay_workers[g_relay_nworkers] != NULL) g_relay_nworkers++;
+    }
+    if (g_relay_nworkers == 0) { CloseHandle(g_iocp); g_iocp = NULL; CloseHandle(g_relay_done); g_relay_done = NULL; return FALSE; }
+    g_relay_accepting = TRUE;
+    return TRUE;
+}
+
+void relay_pool_abort(void)
+{
+    AcquireSRWLockExclusive(&g_relay_lock);
+    g_relay_accepting = FALSE;
+    for (RELAY_CONN *rc = g_relay_head; rc != NULL; rc = rc->next) relay_abort(rc);
+    ReleaseSRWLockExclusive(&g_relay_lock);
+}
+
+void relay_pool_stop(void)
+{
+    if (g_iocp == NULL) return;
+    relay_pool_abort();
+    // No timeout may leave code executing in an engine DLL that is about to unload.
+    WaitForSingleObject(g_relay_done, INFINITE);
+    for (int i = 0; i < g_relay_nworkers; i++) PostQueuedCompletionStatus(g_iocp, 0, 0, NULL);
+    WaitForMultipleObjects(g_relay_nworkers, g_relay_workers, TRUE, INFINITE);
+    for (int i = 0; i < g_relay_nworkers; i++) CloseHandle(g_relay_workers[i]);
+    g_relay_nworkers = 0;
+    CloseHandle(g_iocp); g_iocp = NULL;
+    CloseHandle(g_relay_done); g_relay_done = NULL;
+    AcquireSRWLockExclusive(&g_relay_lock);
+    while (g_relay_pool_n > 0) free(g_relay_pool[--g_relay_pool_n]);
+    ReleaseSRWLockExclusive(&g_relay_lock);
+}
+// Takes over both (already handshaken) sockets. Returns FALSE if the pool is unavailable; the
+// caller then falls back to the blocking relay and still owns the sockets.
+BOOL relay_start(SOCKET client, SOCKET proxy)
+{
+    if (g_iocp == NULL || !running) return FALSE;
+
+    RELAY_CONN *rc = (RELAY_CONN *)calloc(1, sizeof(*rc));
+    if (rc == NULL) return FALSE;
+    if (CreateIoCompletionPort((HANDLE)client, g_iocp, 0, 0) != g_iocp ||
+        CreateIoCompletionPort((HANDLE)proxy,  g_iocp, 0, 0) != g_iocp)
+    {
+        free(rc);
+        return FALSE;
+    }
+    rc->s[0] = client; rc->s[1] = proxy;
+    rc->refs = 2;
+    rc->dir[0].rc = rc; rc->dir[0].src = client; rc->dir[0].dst = proxy;    // upload
+    rc->dir[1].rc = rc; rc->dir[1].src = proxy;  rc->dir[1].dst = client;   // download
+
+    AcquireSRWLockExclusive(&g_relay_lock);
+    if (!g_relay_accepting || !running) { ReleaseSRWLockExclusive(&g_relay_lock); free(rc); return FALSE; }
+    rc->next = g_relay_head;
+    if (g_relay_head) g_relay_head->prev = rc;
+    g_relay_head = rc;
+    InterlockedIncrement(&g_active_relays);
+    ResetEvent(g_relay_done);
+    ReleaseSRWLockExclusive(&g_relay_lock);
+
+    // Both directions start idle (no buffers); the first byte or close wakes them.
+    if (!relay_post_wait(&rc->dir[0])) relay_dir_end(&rc->dir[0], FALSE);
+    if (!relay_post_wait(&rc->dir[1])) relay_dir_end(&rc->dir[1], FALSE);
+    return TRUE;
 }
