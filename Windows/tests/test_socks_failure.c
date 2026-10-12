@@ -29,6 +29,7 @@ int main(void)
     log_count = 0;
     socks5_log_connect_failure("IPv4", "203.0.113.5", 443, 5);
     CHECK(strstr(last_log, "203.0.113.5:443") && strstr(last_log, "connection refused"));
+    CHECK(strncmp(last_log, "level=error ", 12) == 0);
     socks5_log_connect_failure("IPv4", "203.0.113.5", 443, 5);
     CHECK(log_count == 1);
     socks5_log_connect_failure("IPv4", "203.0.113.6", 443, -1);

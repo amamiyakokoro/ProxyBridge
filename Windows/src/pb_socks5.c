@@ -78,8 +78,8 @@ static void socks5_log_connect_failure(const char *kind, const char *dest, UINT1
     last_tick = now;
     ReleaseSRWLockExclusive(&lk);
 
-    if (n > 0) log_message("(previous SOCKS5 failure repeated %d more times)", n);
-    log_message("%s", line);
+    if (n > 0) log_message("level=debug (previous SOCKS5 failure repeated %d more times)", n);
+    log_message("level=error %s", line);
 }
 
 // KokoroBox uses an unauthenticated local SOCKS5 endpoint. Never negotiate
