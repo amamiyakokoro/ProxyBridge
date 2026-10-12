@@ -103,6 +103,18 @@ static BOOL is_proxy_server_endpoint(UINT32 destination, UINT16 port)
     return FALSE;
 }
 
+static BOOL is_proxy_udp_endpoint(UINT32 destination, UINT16 port)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *c = &g_proxy_configs[i];
+        if (c->udp_connected && c->udp_relay_addr.sin_addr.s_addr == destination &&
+            ntohs(c->udp_relay_addr.sin_port) == port)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void reset_stale_tcp_state(UINT16 source_port, BOOL ipv6)
 {
     if (source_port == g_local_relay_port) return;
@@ -370,6 +382,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
             continue;
         }
         packet_len = remaining - next_len;
+        LONG udp_generation = g_udp_generation;
 
         if (ip_header == NULL)
         {
@@ -402,7 +415,13 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         goto ipv6u_send;
                     }
 
-                    if (is_connection_tracked(sp, TRUE, TRUE))
+                    if (udp_direct_cached(TRUE, ipv6_header->SrcAddr, sp, ipv6_header->DstAddr, dp))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
+                    if (udp_flow_validate(sp, TRUE, 0, (const UINT8*)ipv6_header->SrcAddr, 0, (const UINT8*)ipv6_header->DstAddr, dp))
                     {
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
                         static const UINT8 _lb6u2[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -485,6 +504,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                             continue;
                         }
                         add_connection_v6(sp, TRUE, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, pcid6u);
+                        udp_flow_stamp(sp, TRUE, udp_generation);
 
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
                         static const UINT8 _lb6up[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -508,6 +528,8 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     {
                         // DIRECT (or no matching rule): unmodified packet, send as-is without
                         // recomputing checksums (wasteful + can clash with NIC offload, #161).
+                        if (pid6u != 0)
+                            udp_direct_remember(TRUE, ipv6_header->SrcAddr, sp, ipv6_header->DstAddr, dp, udp_generation);
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
                     }
@@ -741,6 +763,15 @@ DWORD WINAPI packet_processor(LPVOID arg)
         {
             if (addr.Outbound)
             {
+                UINT16 source_port = ntohs(udp_header->SrcPort);
+                UINT16 destination_port = ntohs(udp_header->DstPort);
+                if (source_port != LOCAL_UDP_RELAY_PORT &&
+                    (is_proxy_udp_endpoint(ip_header->DstAddr, destination_port) ||
+                     udp_direct_cached(FALSE, &ip_header->SrcAddr, source_port, &ip_header->DstAddr, destination_port)))
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
                 if (udp_header->SrcPort == htons(LOCAL_UDP_RELAY_PORT))
                 {
                     UINT16 dst_port = ntohs(udp_header->DstPort);
@@ -772,7 +803,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         continue;
                     }
                 }
-                else if (is_connection_tracked(ntohs(udp_header->SrcPort), TRUE, FALSE))
+                else if (udp_flow_validate(ntohs(udp_header->SrcPort), FALSE, ip_header->SrcAddr, NULL, ip_header->DstAddr, NULL, ntohs(udp_header->DstPort)))
                 {
                     UINT16 src_port = ntohs(udp_header->SrcPort);
                     udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
@@ -878,6 +909,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     if (action == RULE_ACTION_PROXY)
                     {
                         add_connection(src_port, TRUE, src_ip, dest_ip, dest_port, proxy_config_id);
+                        udp_flow_stamp(src_port, FALSE, udp_generation);
 
                         // redirect to UDP relay server at 127.0.0.1:34011
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
@@ -905,6 +937,8 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         // DIRECT (or no matching rule): the packet is unmodified, so send it
                         // as-is. Recomputing checksums on an untouched packet is wasteful and
                         // can conflict with NIC checksum offload on some drivers (see #161).
+                        if (pid != 0)
+                            udp_direct_remember(FALSE, &src_ip, src_port, &dest_ip, dest_port, udp_generation);
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
                     }
@@ -1202,6 +1236,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
 PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable)
 {
     g_localhost_via_proxy = enable;
+    invalidate_udp_decisions();
     log_message("Localhost routing: %s (most proxies block localhost for SSRF prevention)", enable ? "via proxy" : "direct");
 }
 
@@ -1217,6 +1252,7 @@ PROXYBRIDGE_API void ProxyBridge_SetLoopbackBypassEnabled(BOOL enable)
             InterlockedExchange(&port_direct_bitmap[i], 0);
         }
     }
+    invalidate_udp_decisions();
     log_message("Loopback owner lookup bypass: %s", enable ? "enabled" : "disabled");
 }
 
@@ -1234,12 +1270,14 @@ PROXYBRIDGE_API void ProxyBridge_SetProxyUdpDnsEnabled(BOOL enable)
             InterlockedExchange(&port_direct_bitmap[i], 0);
         }
     }
+    invalidate_udp_decisions();
     log_message("Proxy UDP DNS routing: %s", enable ? "enabled" : "disabled");
 }
 
 PROXYBRIDGE_API void ProxyBridge_SetFailClosedOnUnknownOwner(BOOL enable)
 {
     InterlockedExchange(&g_fail_closed_on_unknown_owner, enable ? TRUE : FALSE);
+    invalidate_udp_decisions();
     log_message("Unknown process owner policy: %s", enable ? "BLOCK" : "DIRECT");
 }
 
@@ -1387,6 +1425,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     if (running)
         return FALSE;
+    invalidate_udp_decisions();
 
     InitializeSRWLock(&lock);
     dns_cache_init();

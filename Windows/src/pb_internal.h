@@ -109,6 +109,7 @@ typedef struct CONNECTION_INFO {
     UINT16 orig_dest_port;
     BOOL   is_tracked;
     UINT8  fin_flags;          // app=1, relay=2; retain mapping for final ACK/retransmits
+    LONG   policy_generation;
     ULONGLONG last_activity;
     UINT32 proxy_config_id;
     BOOL   is_ipv6;
@@ -162,7 +163,7 @@ typedef struct PID_CACHE_ENTRY {
     UINT32 src_ip;
     UINT16 src_port;
     DWORD pid;
-    DWORD timestamp;
+    ULONGLONG timestamp;
     BOOL is_udp;
     struct PID_CACHE_ENTRY *next;
 } PID_CACHE_ENTRY;
@@ -200,6 +201,9 @@ typedef BOOL (*token_match_func)(const char *token, const void *data);
 // ---- shared globals (defined in ProxyBridge.c) ----
 extern PROXY_CONFIG g_proxy_configs[MAX_PROXY_CONFIGS];
 extern int g_proxy_config_count;
+extern volatile LONG g_udp_generation;
+void invalidate_udp_decisions(void);
+void udp_flow_stamp(UINT16 port, BOOL ipv6, LONG generation);
 extern UINT32 g_next_config_id;
 extern CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE];
 extern CONNECTION_INFO *connection_rev_table[CONNECTION_HASH_SIZE];
@@ -383,6 +387,9 @@ BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp);
 void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
 void connection_fin(UINT16 src_port, BOOL is_ipv6, UINT8 bit);
+BOOL udp_flow_validate(UINT16 port, BOOL ipv6, UINT32 source, const UINT8 source6[16], UINT32 destination, const UINT8 destination6[16], UINT16 destination_port);
+BOOL udp_direct_cached(BOOL ipv6, const void *source, UINT16 source_port, const void *destination, UINT16 destination_port);
+void udp_direct_remember(BOOL ipv6, const void *source, UINT16 source_port, const void *destination, UINT16 destination_port, LONG generation);
 void cleanup_stale_connections(void);
 BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);
 void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);

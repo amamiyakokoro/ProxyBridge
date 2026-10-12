@@ -55,6 +55,7 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
             existing->fin_flags = 0;
+            existing->policy_generation = g_udp_generation;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -76,6 +77,7 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
     conn->orig_dest_port = dest_port;
     conn->proxy_config_id = proxy_config_id;
     conn->is_tracked = TRUE;
+    conn->policy_generation = g_udp_generation;
     conn->is_ipv6 = FALSE;
     conn->last_activity = GetTickCount64();
 
@@ -102,6 +104,7 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
             existing->fin_flags = 0;
+            existing->policy_generation = g_udp_generation;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -126,6 +129,7 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
     conn->orig_dest_port = dest_port;
     conn->proxy_config_id = proxy_config_id;
     conn->is_tracked = TRUE;
+    conn->policy_generation = g_udp_generation;
     conn->last_activity = GetTickCount64();
     conn->next = connection_hash_table[hash];
     connection_hash_table[hash] = conn;
@@ -175,6 +179,86 @@ BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UI
     }
     ReleaseSRWLockShared(&lock);
     return found;
+}
+
+volatile LONG g_udp_generation = 1;
+
+void invalidate_udp_decisions(void)
+{
+    InterlockedIncrement(&g_udp_generation);
+}
+
+void udp_flow_stamp(UINT16 port, BOOL ipv6, LONG generation)
+{
+    AcquireSRWLockExclusive(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[port % CONNECTION_HASH_SIZE]; c; c = c->next)
+        if (c->src_port == port && c->is_udp && c->is_ipv6 == ipv6)
+        { c->policy_generation = generation; break; }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Destination changes must re-evaluate rules, rather than carrying a PROXY
+// verdict to a new host/port. UDP owner events and policy changes invalidate it too.
+BOOL udp_flow_validate(UINT16 port, BOOL ipv6, UINT32 source, const UINT8 source6[16],
+                       UINT32 destination, const UINT8 destination6[16], UINT16 destination_port)
+{
+    BOOL valid = FALSE;
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&lock);
+    CONNECTION_INFO **cursor = &connection_hash_table[port % CONNECTION_HASH_SIZE];
+    while (*cursor && !((*cursor)->src_port == port && (*cursor)->is_udp && (*cursor)->is_ipv6 == ipv6))
+        cursor = &(*cursor)->next;
+    CONNECTION_INFO *c = *cursor;
+    if (c != NULL)
+    {
+        BOOL same = c->orig_dest_port == destination_port &&
+            (ipv6 ? memcmp(c->src_ip6, source6, 16) == 0 && memcmp(c->orig_dest_ip6, destination6, 16) == 0
+                  : c->src_ip == source && c->orig_dest_ip == destination);
+        valid = same && c->policy_generation == g_udp_generation &&
+                (now <= c->last_activity || now - c->last_activity <= 20000);
+        if (valid) c->last_activity = now;
+        else { *cursor = c->next; rev_unlink(c); free(c); }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return valid;
+}
+
+typedef struct {
+    UINT8 source[16], destination[16];
+    UINT16 source_port, destination_port;
+    BOOL ipv6;
+    LONG generation;
+    ULONGLONG expires;
+} UDP_DIRECT_ENTRY;
+static UDP_DIRECT_ENTRY udp_direct_entries[4096]; // packet thread owns this table
+
+static UDP_DIRECT_ENTRY *udp_direct_slot(BOOL ipv6, const void *source, UINT16 source_port,
+                                         const void *destination, UINT16 destination_port)
+{
+    UINT32 hash = ((UINT32)source_port << 16) ^ destination_port ^ ipv6;
+    for (int i = 0; i < (ipv6 ? 16 : 4); i++)
+        hash = hash * 31u + ((const UINT8 *)source)[i] + ((const UINT8 *)destination)[i];
+    return &udp_direct_entries[hash % 4096];
+}
+
+BOOL udp_direct_cached(BOOL ipv6, const void *source, UINT16 source_port,
+                       const void *destination, UINT16 destination_port)
+{
+    UDP_DIRECT_ENTRY *entry = udp_direct_slot(ipv6, source, source_port, destination, destination_port);
+    return entry->expires > GetTickCount64() && entry->generation == g_udp_generation &&
+           entry->ipv6 == ipv6 && entry->source_port == source_port && entry->destination_port == destination_port &&
+           memcmp(entry->source, source, ipv6 ? 16 : 4) == 0 &&
+           memcmp(entry->destination, destination, ipv6 ? 16 : 4) == 0;
+}
+
+void udp_direct_remember(BOOL ipv6, const void *source, UINT16 source_port,
+                         const void *destination, UINT16 destination_port, LONG generation)
+{
+    UDP_DIRECT_ENTRY *entry = udp_direct_slot(ipv6, source, source_port, destination, destination_port);
+    memcpy(entry->source, source, ipv6 ? 16 : 4);
+    memcpy(entry->destination, destination, ipv6 ? 16 : 4);
+    entry->ipv6 = ipv6; entry->source_port = source_port; entry->destination_port = destination_port;
+    entry->generation = generation; entry->expires = GetTickCount64() + 5000;
 }
 
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)

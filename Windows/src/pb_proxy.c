@@ -83,6 +83,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     cfg->udp_connected = FALSE;
 
     g_proxy_config_count++;
+    invalidate_udp_decisions();
     log_message("Added proxy config ID %u: %s:%u (type %d)", cfg->config_id, cfg->host, cfg->port, cfg->type);
     return cfg->config_id;
 }
@@ -115,6 +116,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType typ
             cfg->send_domain_to_proxy = send_domain_to_proxy;
             strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
             cfg->resolved_ip = resolved;
+            invalidate_udp_decisions();
 
             log_message("Edited proxy config ID %u: %s:%u (type %d)", config_id, cfg->host, cfg->port, cfg->type);
             return TRUE;
@@ -139,6 +141,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_DeleteProxyConfig(UINT32 config_id)
                 memmove(&g_proxy_configs[i], &g_proxy_configs[i + 1], remaining * sizeof(PROXY_CONFIG));
 
             g_proxy_config_count--;
+            invalidate_udp_decisions();
             log_message("Deleted proxy config ID %u", config_id);
             return TRUE;
         }

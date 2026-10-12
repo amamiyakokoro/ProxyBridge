@@ -422,6 +422,7 @@ void cache_owner_event(const UINT8 local_addr[16], UINT16 local_port,
 {
     if (pid == 0 || local_port == 0)
         return;
+    if (is_udp) invalidate_udp_decisions();
 
     UINT32 hash = owner_cache_hash(local_addr, local_port, is_udp);
     ULONGLONG now = GetTickCount64();
@@ -469,6 +470,21 @@ void remove_owner_event_endpoint(ULONGLONG endpoint_id, UINT8 source_layer)
             if ((*cursor)->endpoint_id == endpoint_id && (*cursor)->source_layer == source_layer)
             {
                 OWNER_CACHE_ENTRY *entry = *cursor;
+                if (entry->is_udp)
+                {
+                    invalidate_udp_decisions();
+                    // A closed endpoint must not survive in the table fallback cache.
+                    for (int bucket = 0; bucket < PID_CACHE_SIZE; bucket++)
+                    {
+                        PID_CACHE_ENTRY **cached = &pid_cache[bucket];
+                        while (*cached)
+                        {
+                            if ((*cached)->is_udp && (*cached)->src_port == entry->local_port)
+                            { PID_CACHE_ENTRY *old = *cached; *cached = old->next; free(old); }
+                            else cached = &(*cached)->next;
+                        }
+                    }
+                }
                 *cursor = entry->next;
                 free(entry);
             }

@@ -1261,6 +1261,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_p
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     log_message("Moved rule ID %u to position %u", rule_id, new_position);
+    invalidate_udp_decisions();
     return TRUE;
 }
 
@@ -1269,6 +1270,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_p
 // functions below release their exclusive lock before calling this.
 void update_has_active_rules(void)
 {
+    invalidate_udp_decisions();
     BOOL has_active = FALSE;
     BOOL has_domain = FALSE;
 
