@@ -1,6 +1,6 @@
 param(
     [string]$WinDivertPath = "C:\WinDivert-2.2.2-A",
-    [string[]]$Tests = @("relay_peer", "packet_batch", "tcp_half_close", "worker_lifecycle", "loopback_bypass")
+    [string[]]$Tests = @("relay_peer", "tcp_tracking", "udp_tracking", "owner_table", "socks_failure", "iocp_relay", "packet_batch", "tcp_half_close", "worker_lifecycle", "loopback_bypass")
 )
 $ErrorActionPreference = "Stop"
 $testOutput = Join-Path ([IO.Path]::GetTempPath()) "proxybridge-core-tests"
