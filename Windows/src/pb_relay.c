@@ -490,6 +490,23 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     return 0;
 }
 
+// Redirected packets arrive from the original destination. A port match alone
+// must not let an unrelated remote peer claim an application's tracked flow.
+static BOOL relay_peer_ok_v4(UINT32 peer, UINT32 original_destination)
+{
+    return (ntohl(peer) >> 24) == 127 || peer == original_destination;
+}
+
+static BOOL relay_peer_ok_v6(const struct in6_addr *peer, const UINT8 original_destination[16])
+{
+    const UINT8 *address = (const UINT8 *)peer;
+    static const UINT8 loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    static const UINT8 mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xFF,0xFF};
+    return memcmp(address, loopback, 16) == 0 ||
+           (memcmp(address, mapped, 12) == 0 && address[12] == 127) ||
+           memcmp(address, original_destination, 16) == 0;
+}
+
 DWORD WINAPI local_proxy_server(LPVOID arg)
 {
     WSADATA wsa_data;
@@ -598,7 +615,8 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     conn_config->is_ipv6 = FALSE;
 
                     UINT16 client_port = ntohs(client_addr.sin_port);
-                    if (get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    if (get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id) &&
+                        relay_peer_ok_v4(client_addr.sin_addr.s_addr, conn_config->orig_dest_ip))
                     {
                         if (begin_connection_worker())
                         {
@@ -629,7 +647,8 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     conn_config->is_ipv6 = TRUE;
 
                     UINT16 client_port = ntohs(client_addr6.sin6_port);
-                    if (get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    if (get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id) &&
+                        relay_peer_ok_v6(&client_addr6.sin6_addr, conn_config->orig_dest_ip6))
                     {
                         if (begin_connection_worker())
                         {
