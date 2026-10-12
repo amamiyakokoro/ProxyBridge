@@ -25,3 +25,10 @@ DispatchQueue.concurrentPerform(iterations: 1000) { index in
 buffer.clear()
 precondition(buffer.drain().isEmpty)
 print("Provider logs: bounded capacity, draining, clear, timestamp and concurrency checks passed")
+
+precondition(socks5DomainBytes("") == nil)
+precondition(socks5DomainBytes(String(repeating: "a", count: 255))?.count == 255)
+precondition(socks5DomainBytes(String(repeating: "a", count: 256)) == nil)
+precondition(socks5DomainBytes("測試.example") == Array("測試.example".utf8))
+precondition(socks5DomainBytes(String(repeating: "測", count: 86)) == nil)
+print("SOCKS5 domain encoding: UTF-8 byte counts and bounds passed")

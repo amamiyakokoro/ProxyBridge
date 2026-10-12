@@ -1,6 +1,11 @@
 import NetworkExtension
 import Foundation
 
+private func socks5DomainBytes(_ domain: String) -> [UInt8]? {
+    let bytes = Array(domain.utf8)
+    return !bytes.isEmpty && bytes.count <= 255 ? bytes : nil
+}
+
 enum RuleProtocol: String, Codable {
     case tcp = "TCP"
     case udp = "UDP"
@@ -736,6 +741,9 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
+        handshakeLock.lock()
+        proxyStopping = false
+        handshakeLock.unlock()
         installKokoroBoxPolicyObserver()
         if let tunnelProtocol = protocolConfiguration as? NETunnelProviderProtocol,
            let data = tunnelProtocol.providerConfiguration?["kokoroBoxConfiguration"] as? Data {
@@ -762,12 +770,25 @@ class AppProxyProvider: NETransparentProxyProvider {
             settings.excludedNetworkRules = Self.kokoroBoxExcludedNetworkRules
         }
         
-        self.setTunnelNetworkSettings(settings) { error in
+        self.setTunnelNetworkSettings(settings) { [weak self] error in
+            if error == nil { self?.startUDPSweepTimer() }
             completionHandler(error)
         }
     }
     
     override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        handshakeLock.lock()
+        proxyStopping = true
+        udpSweepTimer?.cancel()
+        udpSweepTimer = nil
+        let handshakes = Array(pendingHandshakes.values)
+        pendingHandshakes.removeAll()
+        handshakeLock.unlock()
+        for handshake in handshakes {
+            handshake.connection.cancel()
+            handshake.flow.closeReadWithError(nil)
+            handshake.flow.closeWriteWithError(nil)
+        }
         removeKokoroBoxPolicyObserver()
         lastKokoroBoxPolicyRevision = nil
         kokoroBoxConfigurationLock.lock()
@@ -781,6 +802,8 @@ class AppProxyProvider: NETransparentProxyProvider {
             a.controlConnection.cancel()
             a.udpSession.cancel()
             a.dnsSession?.cancel()
+            a.clientFlow.closeReadWithError(nil)
+            a.clientFlow.closeWriteWithError(nil)
         }
         completionHandler()
     }
@@ -795,6 +818,20 @@ class AppProxyProvider: NETransparentProxyProvider {
         let displayName: String
         var loggedDestinations = Set<String>()  // dedupe connection logs, bounded
         var isTornDown = false
+        private var lastActivity = ProcessInfo.processInfo.systemUptime
+        private let activityLock = NSLock()
+
+        func touch() {
+            activityLock.lock()
+            lastActivity = ProcessInfo.processInfo.systemUptime
+            activityLock.unlock()
+        }
+
+        func idleTime() -> TimeInterval {
+            activityLock.lock()
+            defer { activityLock.unlock() }
+            return ProcessInfo.processInfo.systemUptime - lastActivity
+        }
         private let dnsLock = NSLock()
         private var dnsEndpoints: [UInt16: [NWHostEndpoint]] = [:]
         private var pendingDnsEndpointCount = 0
@@ -836,6 +873,80 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     private var udpAssociations: [NEAppProxyUDPFlow: UDPAssociation] = [:]
     private let udpLock = NSLock()
+
+    private struct PendingHandshake {
+        let token: UUID
+        let flow: NEAppProxyFlow
+        let connection: NWTCPConnection
+    }
+    private var pendingHandshakes: [ObjectIdentifier: PendingHandshake] = [:]
+    private let handshakeLock = NSLock()
+    private var proxyStopping = false
+    private var udpSweepTimer: DispatchSourceTimer?
+    private static let udpIdleTimeout: TimeInterval = 120
+    private static let handshakeTimeout: TimeInterval = 20
+
+    private func startUDPSweepTimer() {
+        handshakeLock.lock()
+        defer { handshakeLock.unlock() }
+        guard !proxyStopping else { return }
+        udpSweepTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 30, repeating: 30, leeway: .seconds(5))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.udpLock.lock()
+            let stale = self.udpAssociations.filter { $0.value.idleTime() > Self.udpIdleTimeout }.map { $0.key }
+            self.udpLock.unlock()
+            for flow in stale { self.teardownUDP(flow, onlyIfIdle: true) }
+        }
+        timer.resume()
+        udpSweepTimer = timer
+    }
+
+    private func armHandshakeTimeout(flow: NEAppProxyFlow, connection: NWTCPConnection) -> Bool {
+        let id = ObjectIdentifier(connection)
+        let token = UUID()
+        handshakeLock.lock()
+        guard !proxyStopping else {
+            handshakeLock.unlock()
+            connection.cancel()
+            flow.closeReadWithError(nil)
+            flow.closeWriteWithError(nil)
+            return false
+        }
+        pendingHandshakes[id] = PendingHandshake(token: token, flow: flow, connection: connection)
+        handshakeLock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
+            guard let self else { return }
+            self.handshakeLock.lock()
+            let pending = self.pendingHandshakes[id]
+            let timedOut = pending?.token == token
+            if timedOut { self.pendingHandshakes.removeValue(forKey: id) }
+            self.handshakeLock.unlock()
+            if timedOut, let pending {
+                pending.connection.cancel()
+                pending.flow.closeReadWithError(nil)
+                pending.flow.closeWriteWithError(nil)
+            }
+        }
+        return true
+    }
+
+    private func completeHandshake(_ connection: NWTCPConnection) -> Bool {
+        handshakeLock.lock()
+        defer { handshakeLock.unlock() }
+        return pendingHandshakes.removeValue(forKey: ObjectIdentifier(connection)) != nil && !proxyStopping
+    }
+
+    private func closeRelay(_ flow: NEAppProxyTCPFlow, _ connection: NWTCPConnection, error: Error? = nil) {
+        handshakeLock.lock()
+        pendingHandshakes.removeValue(forKey: ObjectIdentifier(connection))
+        handshakeLock.unlock()
+        connection.cancel()
+        flow.closeReadWithError(error)
+        flow.closeWriteWithError(error)
+    }
     
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         guard let message = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any],
@@ -1079,6 +1190,8 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return false
             case .block:
                 sendLogToApp(protocol: "UDP", process: displayName, destination: "unknown", port: "unknown", proxy: "BLOCK")
+                flow.closeReadWithError(nil)
+                flow.closeWriteWithError(nil)
                 return true
             case .proxy(let configuration):
                 flow.open(withLocalEndpoint: nil) { [weak self] error in
@@ -1118,6 +1231,8 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return false
             case "BLOCK":
                 sendLogToApp(protocol: "UDP", process: displayName, destination: "unknown", port: "unknown", proxy: "BLOCK")
+                flow.closeReadWithError(nil)
+                flow.closeWriteWithError(nil)
                 return true
             default:
                 proxyLock.lock()
@@ -1154,6 +1269,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     private func proxyUDPFlowViaSOCKS5(_ clientFlow: NEAppProxyUDPFlow, displayName: String, socksHost: String, socksPort: Int, username: String?, password: String?) {
         let proxyEndpoint = NWHostEndpoint(hostname: socksHost, port: String(socksPort))
         let tcpConnection = createTCPConnection(to: proxyEndpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
+        guard armHandshakeTimeout(flow: clientFlow, connection: tcpConnection) else { return }
 
         // offer username/password auth when we have credentials, same as the tcp path
         let useAuth = (username != nil && password != nil)
@@ -1335,6 +1451,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     
     private func relayUDPThroughSOCKS5(clientFlow: NEAppProxyUDPFlow, relayHost: String, relayPort: UInt16, tcpConnection: NWTCPConnection, displayName: String) {
+        guard completeHandshake(tcpConnection) else { return }
         let relayEndpoint = NWHostEndpoint(hostname: relayHost, port: String(relayPort))
         let udpSession = self.createUDPSession(to: relayEndpoint, from: nil)
         let dnsSession: NWUDPSession?
@@ -1356,10 +1473,21 @@ class AppProxyProvider: NETransparentProxyProvider {
             displayName: displayName
         )
 
+        handshakeLock.lock()
+        guard !proxyStopping else {
+            handshakeLock.unlock()
+            tcpConnection.cancel()
+            udpSession.cancel()
+            dnsSession?.cancel()
+            clientFlow.closeReadWithError(nil)
+            clientFlow.closeWriteWithError(nil)
+            return
+        }
         udpLock.lock()
         let existing = udpAssociations[clientFlow]
         udpAssociations[clientFlow] = association
         udpLock.unlock()
+        handshakeLock.unlock()
         // if the app reused a flow, drop the stale association first
         existing?.controlConnection.cancel()
         existing?.udpSession.cancel()
@@ -1376,12 +1504,14 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
 
     // idempotent, cancels both channels and closes the flow exactly once
-    private func teardownUDP(_ flow: NEAppProxyUDPFlow) {
+    private func teardownUDP(_ flow: NEAppProxyUDPFlow, onlyIfIdle: Bool = false) {
         udpLock.lock()
-        guard let assoc = udpAssociations.removeValue(forKey: flow), !assoc.isTornDown else {
+        guard let assoc = udpAssociations[flow], !assoc.isTornDown,
+              !onlyIfIdle || assoc.idleTime() > Self.udpIdleTimeout else {
             udpLock.unlock()
             return
         }
+        udpAssociations.removeValue(forKey: flow)
         assoc.isTornDown = true
         udpLock.unlock()
 
@@ -1412,6 +1542,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             }
 
             var toSend: [Data] = []
+            association.touch()
             toSend.reserveCapacity(datagrams.count)
             var dnsToSend: [Data] = []
             dnsToSend.reserveCapacity(datagrams.count)
@@ -1485,6 +1616,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             }
 
             guard let datagrams = datagrams, !datagrams.isEmpty else { return }
+            association.touch()
 
             var payloads: [Data] = []
             var endpoints: [NWEndpoint] = []
@@ -1517,6 +1649,7 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return
             }
             guard let datagrams = datagrams, !datagrams.isEmpty else { return }
+            association.touch()
 
             var payloads: [Data] = []
             var endpoints: [NWEndpoint] = []
@@ -1631,6 +1764,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     private func proxyTCPFlow(_ flow: NEAppProxyTCPFlow, destination: String, port: UInt16, config: StoredProxyConfig) {
         let proxyEndpoint = NWHostEndpoint(hostname: config.host, port: String(config.port))
         let proxyConnection = createTCPConnection(to: proxyEndpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
+        guard armHandshakeTimeout(flow: flow, connection: proxyConnection) else { return }
 
         switch config.type.lowercased() {
         case "socks5":
@@ -1760,9 +1894,14 @@ class AppProxyProvider: NETransparentProxyProvider {
             request.append(0x04)
             request.append(contentsOf: ipAddr.rawValue)
         } else {
+            guard let hostBytes = socks5DomainBytes(destination) else {
+                log("SOCKS5 destination name exceeds 255 UTF-8 bytes", level: "ERROR")
+                closeRelay(clientFlow, proxyConnection)
+                return
+            }
             request.append(0x03)
-            request.append(UInt8(destination.count))
-            request.append(destination.data(using: .utf8) ?? Data())
+            request.append(UInt8(hostBytes.count))
+            request.append(contentsOf: hostBytes)
         }
         
         request.append(UInt8(port >> 8))
@@ -1867,10 +2006,11 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
     
     private func relayData(clientFlow: NEAppProxyTCPFlow, proxyConnection: NWTCPConnection) {
+        guard completeHandshake(proxyConnection) else { return }
         clientFlow.open(withLocalEndpoint: nil) { [weak self] error in
             if let error = error {
                 self?.log("Failed to open client flow: \(error.localizedDescription)", level: "ERROR")
-                proxyConnection.cancel()
+                self?.closeRelay(clientFlow, proxyConnection, error: error)
                 return
             }
             
@@ -1887,20 +2027,19 @@ class AppProxyProvider: NETransparentProxyProvider {
                 if code != 57 && code != 54 && code != 89 {
                     self?.log("Client read error: \(error.localizedDescription)", level: "ERROR")
                 }
-                proxyConnection.cancel()
+                self?.closeRelay(clientFlow, proxyConnection)
                 return
             }
             
             guard let data = data, !data.isEmpty else {
-                proxyConnection.cancel()
+                self?.closeRelay(clientFlow, proxyConnection)
                 return
             }
             
             proxyConnection.write(data) { error in
                 if let error = error {
                     self?.log("Proxy write error: \(error.localizedDescription)", level: "ERROR")
-                    clientFlow.closeReadWithError(error)
-                    clientFlow.closeWriteWithError(error)
+                    self?.closeRelay(clientFlow, proxyConnection, error: error)
                 } else {
                     self?.relayClientToProxy(clientFlow: clientFlow, proxyConnection: proxyConnection)
                 }
@@ -1915,21 +2054,19 @@ class AppProxyProvider: NETransparentProxyProvider {
                 if code != 57 && code != 54 && code != 89 {
                     self?.log("Proxy read error: \(error.localizedDescription)", level: "ERROR")
                 }
-                clientFlow.closeReadWithError(nil)
-                clientFlow.closeWriteWithError(nil)
+                self?.closeRelay(clientFlow, proxyConnection)
                 return
             }
             
             guard let data = data, !data.isEmpty else {
-                clientFlow.closeReadWithError(nil)
-                clientFlow.closeWriteWithError(nil)
+                self?.closeRelay(clientFlow, proxyConnection)
                 return
             }
             
             clientFlow.write(data) { error in
                 if let error = error {
                     self?.log("Client write error: \(error.localizedDescription)", level: "ERROR")
-                    proxyConnection.cancel()
+                    self?.closeRelay(clientFlow, proxyConnection, error: error)
                 } else {
                     self?.relayProxyToClient(clientFlow: clientFlow, proxyConnection: proxyConnection)
                 }
