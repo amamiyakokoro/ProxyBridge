@@ -1195,7 +1195,11 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return true
             case .proxy(let configuration):
                 flow.open(withLocalEndpoint: nil) { [weak self] error in
-                    guard error == nil, let self else { return }
+                    guard error == nil, let self else {
+                        flow.closeReadWithError(error)
+                        flow.closeWriteWithError(error)
+                        return
+                    }
                     self.proxyUDPFlowViaSOCKS5(
                         flow,
                         displayName: displayName,
@@ -1240,10 +1244,11 @@ class AppProxyProvider: NETransparentProxyProvider {
                 proxyLock.unlock()
                 guard let socks5Config = matched, socks5Config.type.lowercased() == "socks5" else { return false }
                 flow.open(withLocalEndpoint: nil) { [weak self] error in
-                    guard let self = self else { return }
                     // a closed flow here is normal churn (quic opening and dropping
-                    // udp/443 flows constantly), nothing to do and not worth logging
-                    if error != nil {
+                    // udp/443 flows constantly); close both sides without logging.
+                    guard error == nil, let self else {
+                        flow.closeReadWithError(error)
+                        flow.closeWriteWithError(error)
                         return
                     }
                     // pass the resolved display name (curl), not the raw signing id (curl-<hash>)
@@ -1498,15 +1503,23 @@ class AppProxyProvider: NETransparentProxyProvider {
         if association.dnsSession != nil {
             readAndForwardDnsUDP(association)
         }
-        // note: we deliberately don't read the control connection to detect close.
-        // holding a strong ref keeps the associate alive, and reading it risks a
-        // spurious teardown that would EPIPE the app's udp socket.
+        monitorControlConnection(association)
+    }
+
+    // RFC 1928 ties the UDP association to this TCP connection. EOF or error
+    // ends it; unexpected control data also invalidates the association.
+    private func monitorControlConnection(_ association: UDPAssociation) {
+        association.controlConnection.readMinimumLength(1, maximumLength: 1) { [weak self, weak association] _, _ in
+            guard let self, let association else { return }
+            self.teardownUDP(association.clientFlow, expectedAssociation: association)
+        }
     }
 
     // idempotent, cancels both channels and closes the flow exactly once
-    private func teardownUDP(_ flow: NEAppProxyUDPFlow, onlyIfIdle: Bool = false) {
+    private func teardownUDP(_ flow: NEAppProxyUDPFlow, onlyIfIdle: Bool = false, expectedAssociation: UDPAssociation? = nil) {
         udpLock.lock()
         guard let assoc = udpAssociations[flow], !assoc.isTornDown,
+              expectedAssociation == nil || assoc === expectedAssociation,
               !onlyIfIdle || assoc.idleTime() > Self.udpIdleTimeout else {
             udpLock.unlock()
             return
@@ -1529,7 +1542,7 @@ class AppProxyProvider: NETransparentProxyProvider {
 
             if let error = error {
                 self.log("UDP read error: \(error.localizedDescription)", level: "ERROR")
-                self.teardownUDP(clientFlow)
+                self.teardownUDP(clientFlow, expectedAssociation: association)
                 return
             }
 
@@ -1537,7 +1550,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             // re-arming on empty spins at 100% cpu because the read completes
             // immediately forever once the flow is closed (issue #89 / pr #90)
             guard let datagrams = datagrams, let endpoints = endpoints, !datagrams.isEmpty else {
-                self.teardownUDP(clientFlow)
+                self.teardownUDP(clientFlow, expectedAssociation: association)
                 return
             }
 
@@ -1609,9 +1622,8 @@ class AppProxyProvider: NETransparentProxyProvider {
             guard let self = self else { return }
 
             if let error = error {
-                // stop reading the relay but don't close the app's flow, let it
-                // time out on its own instead of getting a hard EPIPE
                 self.log("UDP relay error: \(error.localizedDescription)", level: "ERROR")
+                self.teardownUDP(clientFlow, expectedAssociation: association)
                 return
             }
 
