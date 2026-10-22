@@ -1,5 +1,10 @@
 ## Windows
 
+Windows/**/*.res
+Windows/**/*.obj
+Windows/**/*.lib
+Windows/**/*.exp
+Windows/**/*.pdb
 *.exe
 *.dll
 *.sys

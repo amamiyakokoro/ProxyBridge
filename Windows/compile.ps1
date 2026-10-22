@@ -31,16 +31,23 @@ if (Test-Path $OutputDirectory) { Remove-Item $OutputDirectory -Recurse -Force }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
 $dllPath = Join-Path $OutputDirectory "ProxyBridgeCore.dll"
-$args = "/nologo /O2 /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+$resourcePath = Join-Path $OutputDirectory "ProxyBridgeCore.res"
+& (Join-Path $PSScriptRoot "build-version-resource.ps1") -VcVars $vcVars -OutputPath $resourcePath
+$CompilerArgs = "/nologo /O2 /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
     "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
-    "/GS /guard:cf /I`"$WinDivertPath\include`" $SourceFiles /LD /link /LTCG /OPT:REF /OPT:ICF " +
+    "/GS /guard:cf /I`"$WinDivertPath\include`" $SourceFiles `"$resourcePath`" /LD /link /LTCG /OPT:REF /OPT:ICF " +
     "/RELEASE /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf /LIBPATH:`"$WinDivertPath\x64`" " +
     "WinDivert.lib ws2_32.lib iphlpapi.lib /OUT:`"$dllPath`""
-$command = "`"$vcVars`" x64 >nul && cd /d `"$PSScriptRoot`" && cl.exe $args"
-cmd /c $command
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dllPath)) {
-    throw "ProxyBridgeCore.dll build failed."
+$command = "`"$vcVars`" x64 >nul && cd /d `"$PSScriptRoot`" && cl.exe $CompilerArgs"
+try {
+    cmd /c $command
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dllPath)) {
+        throw "ProxyBridgeCore.dll build failed."
+    }
+} finally {
+    Remove-Item $resourcePath -Force
 }
+& (Join-Path $PSScriptRoot "test-version-info.ps1") -DllPath $dllPath
 
 Copy-Item "$WinDivertPath\x64\WinDivert.dll" $OutputDirectory -Force
 Copy-Item "$WinDivertPath\x64\WinDivert64.sys" $OutputDirectory -Force
