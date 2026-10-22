@@ -797,13 +797,10 @@ class AppProxyProvider: NETransparentProxyProvider {
         udpLock.lock()
         let all = Array(udpAssociations.values)
         udpAssociations.removeAll()
+        for association in all { association.isTornDown = true }
         udpLock.unlock()
         for a in all {
-            a.controlConnection.cancel()
-            a.udpSession.cancel()
-            a.dnsSession?.cancel()
-            a.clientFlow.closeReadWithError(nil)
-            a.clientFlow.closeWriteWithError(nil)
+            a.releaseResources()
         }
         completionHandler()
     }
@@ -842,6 +839,20 @@ class AppProxyProvider: NETransparentProxyProvider {
             self.udpSession = udpSession
             self.dnsSession = dnsSession
             self.displayName = displayName
+        }
+
+        // NWUDPSession may keep its handler after cancellation. Detach both
+        // handlers before cancelling so neither session retains the flow graph.
+        func releaseResources(closeFlow: Bool = true) {
+            udpSession.setReadHandler({ _, _ in }, maxDatagrams: 1)
+            dnsSession?.setReadHandler({ _, _ in }, maxDatagrams: 1)
+            controlConnection.cancel()
+            udpSession.cancel()
+            dnsSession?.cancel()
+            if closeFlow {
+                clientFlow.closeReadWithError(nil)
+                clientFlow.closeWriteWithError(nil)
+            }
         }
 
         func rememberDnsEndpoint(_ endpoint: NWHostEndpoint, transactionID: UInt16) {
@@ -1370,40 +1381,120 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return
             }
 
-            // read at least VER+REP so we can report the reason even on a short reply
-            tcpConnection.readMinimumLength(2, maximumLength: 512) { [weak self] data, error in
-                guard let self = self else { return }
+            self.readSOCKS5Reply(tcpConnection) { [weak self] reply in
+                guard let self else { return }
+                switch reply {
+                case .failed(let reason):
+                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE failed: \(reason)")
+                case .rejected(let rep):
+                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE rejected, REP=0x\(String(format: "%02x", rep)) (\(self.socksReplyReason(rep)))")
+                case .success(let data):
+                    let (parsedHost, relayPort) = self.parseSOCKS5Address(from: data, offset: 3)
+                    // An unspecified address means reuse the control connection host.
+                    let unspecified = parsedHost == "0.0.0.0" ||
+                        IPv6Address(parsedHost)?.rawValue.allSatisfy { $0 == 0 } == true
+                    let relayHost = unspecified ? socksHost : parsedHost
+                    guard relayPort != 0 else {
+                        self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE returned no relay port")
+                        return
+                    }
+                    self.relayUDPThroughSOCKS5(clientFlow: clientFlow, relayHost: relayHost, relayPort: relayPort, tcpConnection: tcpConnection, displayName: displayName)
+                }
+            }
+        }
+    }
 
-                if let error = error {
-                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE response error: \(error.localizedDescription)")
+    private enum SOCKS5Reply {
+        case success(Data)
+        case rejected(UInt8)
+        case failed(String)
+    }
+
+    // The maximum is also exact: a server-first banner must remain in the TCP
+    // stream for the relay, rather than being swallowed with the proxy reply.
+    private func readExact(_ connection: NWTCPConnection, _ count: Int, completion: @escaping (Data?, Error?) -> Void) {
+        connection.readMinimumLength(count, maximumLength: count) { data, error in
+            guard error == nil, let data, data.count == count else {
+                completion(nil, error)
+                return
+            }
+            completion(Data(data), nil)
+        }
+    }
+
+    private func readSOCKS5Reply(_ connection: NWTCPConnection, completion: @escaping (SOCKS5Reply) -> Void) {
+        // Read REP separately so even a short rejection reports its reason.
+        readExact(connection, 2) { [weak self] prefix, error in
+            guard let self else { return }
+            guard let prefix, prefix[0] == 0x05 else {
+                completion(.failed(error?.localizedDescription ?? "invalid or truncated reply"))
+                return
+            }
+            guard prefix[1] == 0 else { completion(.rejected(prefix[1])); return }
+            self.readExact(connection, 2) { addressHeader, error in
+                guard let addressHeader, addressHeader[0] == 0 else {
+                    completion(.failed(error?.localizedDescription ?? "invalid or truncated address header"))
                     return
                 }
+                let header = prefix + addressHeader
+                func finish(_ data: Data?, _ error: Error?, prefix: Data) {
+                    guard let data else {
+                        completion(.failed(error?.localizedDescription ?? "truncated address"))
+                        return
+                    }
+                    completion(.success(prefix + data))
+                }
+                switch addressHeader[1] {
+                case 0x01:
+                    self.readExact(connection, 6) { finish($0, $1, prefix: header) }
+                case 0x04:
+                    self.readExact(connection, 18) { finish($0, $1, prefix: header) }
+                case 0x03:
+                    self.readExact(connection, 1) { length, error in
+                        guard let length, length[0] > 0 else {
+                            completion(.failed(error?.localizedDescription ?? "invalid domain length"))
+                            return
+                        }
+                        self.readExact(connection, Int(length[0]) + 2) {
+                            finish($0, $1, prefix: header + length)
+                        }
+                    }
+                default:
+                    completion(.failed("unsupported address type"))
+                }
+            }
+        }
+    }
 
-                guard let data = data, data.count >= 2, data[0] == 0x05 else {
-                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE bad reply (\(data?.count ?? 0) bytes)")
+    private static let maximumHTTPConnectHeaderSize = 16384
+
+    private func readHTTPConnectResponse(_ connection: NWTCPConnection, buffer: Data = Data(), completion: @escaping (Int?, Data, String) -> Void) {
+        let remaining = Self.maximumHTTPConnectHeaderSize - buffer.count
+        guard remaining > 0 else {
+            completion(nil, Data(), "response headers too large")
+            return
+        }
+        connection.readMinimumLength(1, maximumLength: min(8192, remaining)) { [weak self] data, error in
+            guard let self else { return }
+            guard error == nil, let data, !data.isEmpty else {
+                completion(nil, Data(), error?.localizedDescription ?? "truncated response headers")
+                return
+            }
+            var received = buffer
+            received.append(data)
+            if let end = received.range(of: Data([13, 10, 13, 10])) {
+                let headers = String(decoding: received[..<end.lowerBound], as: UTF8.self)
+                let statusLine = headers.components(separatedBy: "\r\n").first ?? ""
+                let parts = statusLine.split(separator: " ", omittingEmptySubsequences: true)
+                guard parts.count >= 2, parts[0] == "HTTP/1.0" || parts[0] == "HTTP/1.1",
+                      parts[1].utf8.count == 3, parts[1].utf8.allSatisfy({ (48...57).contains($0) }),
+                      let status = Int(parts[1]), (100...599).contains(status) else {
+                    completion(nil, Data(), "invalid HTTP status line")
                     return
                 }
-
-                let rep = data[1]
-                guard rep == 0x00 else {
-                    let reason = self.socksReplyReason(rep)
-                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE rejected, REP=0x\(String(format: "%02x", rep)) (\(reason))")
-                    return
-                }
-
-                guard data.count >= 10 else {
-                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE reply too short (\(data.count) bytes)")
-                    return
-                }
-
-                let (parsedHost, relayPort) = self.parseSOCKS5Address(from: data, offset: 3)
-                // many socks servers reply 0.0.0.0 meaning "reuse the control connection host"
-                let relayHost = (parsedHost == "0.0.0.0" || parsedHost == "::" || parsedHost.isEmpty) ? socksHost : parsedHost
-                guard relayPort != 0 else {
-                    self.failUDPHandshake(clientFlow, tcpConnection, "SOCKS5 UDP ASSOCIATE returned no relay port")
-                    return
-                }
-                self.relayUDPThroughSOCKS5(clientFlow: clientFlow, relayHost: relayHost, relayPort: relayPort, tcpConnection: tcpConnection, displayName: displayName)
+                completion(status, Data(received[end.upperBound...]), statusLine)
+            } else {
+                self.readHTTPConnectResponse(connection, buffer: received, completion: completion)
             }
         }
     }
@@ -1481,22 +1572,17 @@ class AppProxyProvider: NETransparentProxyProvider {
         handshakeLock.lock()
         guard !proxyStopping else {
             handshakeLock.unlock()
-            tcpConnection.cancel()
-            udpSession.cancel()
-            dnsSession?.cancel()
-            clientFlow.closeReadWithError(nil)
-            clientFlow.closeWriteWithError(nil)
+            association.releaseResources()
             return
         }
         udpLock.lock()
         let existing = udpAssociations[clientFlow]
+        existing?.isTornDown = true
         udpAssociations[clientFlow] = association
         udpLock.unlock()
         handshakeLock.unlock()
         // if the app reused a flow, drop the stale association first
-        existing?.controlConnection.cancel()
-        existing?.udpSession.cancel()
-        existing?.dnsSession?.cancel()
+        existing?.releaseResources(closeFlow: false)
 
         readAndForwardClientUDP(association)
         readAndForwardRelayUDP(association)
@@ -1528,17 +1614,19 @@ class AppProxyProvider: NETransparentProxyProvider {
         assoc.isTornDown = true
         udpLock.unlock()
 
-        assoc.controlConnection.cancel()
-        assoc.udpSession.cancel()
-        assoc.dnsSession?.cancel()
-        flow.closeReadWithError(nil)
-        flow.closeWriteWithError(nil)
+        assoc.releaseResources()
+    }
+
+    private func isCurrentUDPAssociation(_ association: UDPAssociation) -> Bool {
+        udpLock.lock()
+        defer { udpLock.unlock() }
+        return !association.isTornDown && udpAssociations[association.clientFlow] === association
     }
 
     private func readAndForwardClientUDP(_ association: UDPAssociation) {
-        let clientFlow = association.clientFlow
-        clientFlow.readDatagrams { [weak self] datagrams, endpoints, error in
-            guard let self = self else { return }
+        association.clientFlow.readDatagrams { [weak self, weak association] datagrams, endpoints, error in
+            guard let self, let association, self.isCurrentUDPAssociation(association) else { return }
+            let clientFlow = association.clientFlow
 
             if let error = error {
                 self.log("UDP read error: \(error.localizedDescription)", level: "ERROR")
@@ -1617,9 +1705,9 @@ class AppProxyProvider: NETransparentProxyProvider {
     }
 
     private func readAndForwardRelayUDP(_ association: UDPAssociation) {
-        let clientFlow = association.clientFlow
-        association.udpSession.setReadHandler({ [weak self] datagrams, error in
-            guard let self = self else { return }
+        association.udpSession.setReadHandler({ [weak self, weak association] datagrams, error in
+            guard let self, let association, self.isCurrentUDPAssociation(association) else { return }
+            let clientFlow = association.clientFlow
 
             if let error = error {
                 self.log("UDP relay error: \(error.localizedDescription)", level: "ERROR")
@@ -1654,8 +1742,8 @@ class AppProxyProvider: NETransparentProxyProvider {
 
     private func readAndForwardDnsUDP(_ association: UDPAssociation) {
         guard let dnsSession = association.dnsSession else { return }
-        dnsSession.setReadHandler({ [weak self] datagrams, error in
-            guard let self = self else { return }
+        dnsSession.setReadHandler({ [weak self, weak association] datagrams, error in
+            guard let self, let association, self.isCurrentUDPAssociation(association) else { return }
             if let error = error {
                 self.log("Mihomo DNS relay error: \(error.localizedDescription)", level: "ERROR")
                 return
@@ -1928,26 +2016,18 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return
             }
             
-            proxyConnection.readMinimumLength(10, maximumLength: 512) { [weak self] data, error in
-                guard let self = self else { return }
-                
-                if let error = error {
-                    self.log("SOCKS5 connect response failed: \(error.localizedDescription)", level: "ERROR")
-                    clientFlow.closeReadWithError(error)
-                    clientFlow.closeWriteWithError(error)
-                    proxyConnection.cancel()
-                    return
+            self?.readSOCKS5Reply(proxyConnection) { [weak self] reply in
+                guard let self else { return }
+                switch reply {
+                case .success:
+                    self.relayData(clientFlow: clientFlow, proxyConnection: proxyConnection)
+                case .rejected(let rep):
+                    self.log("SOCKS5 connect rejected, REP=0x\(String(format: "%02x", rep)) (\(self.socksReplyReason(rep)))", level: "ERROR")
+                    self.closeRelay(clientFlow, proxyConnection)
+                case .failed(let reason):
+                    self.log("SOCKS5 connect failed: \(reason)", level: "ERROR")
+                    self.closeRelay(clientFlow, proxyConnection)
                 }
-                
-                guard let data = data, data.count >= 10, data[0] == 0x05, data[1] == 0x00 else {
-                    self.log("SOCKS5 connect failed", level: "ERROR")
-                    clientFlow.closeReadWithError(nil)
-                    clientFlow.closeWriteWithError(nil)
-                    proxyConnection.cancel()
-                    return
-                }
-                
-                self.relayData(clientFlow: clientFlow, proxyConnection: proxyConnection)
             }
         }
     }
@@ -1985,39 +2065,19 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return
             }
             
-            proxyConnection.readMinimumLength(1, maximumLength: 8192) { [weak self] data, error in
-                guard let self = self else { return }
-                
-                if let error = error {
-                    self.log("HTTP CONNECT response failed: \(error.localizedDescription)", level: "ERROR")
-                    clientFlow.closeReadWithError(error)
-                    clientFlow.closeWriteWithError(error)
-                    proxyConnection.cancel()
-                    return
-                }
-                
-                guard let data = data,
-                      let response = String(data: data, encoding: .utf8) else {
-                    self.log("HTTP CONNECT invalid response", level: "ERROR")
-                    clientFlow.closeReadWithError(nil)
-                    clientFlow.closeWriteWithError(nil)
-                    proxyConnection.cancel()
-                    return
-                }
-                
-                if response.contains("200") {
-                    self.relayData(clientFlow: clientFlow, proxyConnection: proxyConnection)
+            self?.readHTTPConnectResponse(proxyConnection) { [weak self] status, leftover, detail in
+                guard let self else { return }
+                if let status, (200...299).contains(status) {
+                    self.relayData(clientFlow: clientFlow, proxyConnection: proxyConnection, initialData: leftover)
                 } else {
-                    self.log("HTTP CONNECT failed: \(response)", level: "ERROR")
-                    clientFlow.closeReadWithError(nil)
-                    clientFlow.closeWriteWithError(nil)
-                    proxyConnection.cancel()
+                    self.log("HTTP CONNECT failed: \(detail)", level: "ERROR")
+                    self.closeRelay(clientFlow, proxyConnection)
                 }
             }
         }
     }
     
-    private func relayData(clientFlow: NEAppProxyTCPFlow, proxyConnection: NWTCPConnection) {
+    private func relayData(clientFlow: NEAppProxyTCPFlow, proxyConnection: NWTCPConnection, initialData: Data = Data()) {
         guard completeHandshake(proxyConnection) else { return }
         clientFlow.open(withLocalEndpoint: nil) { [weak self] error in
             if let error = error {
@@ -2027,7 +2087,19 @@ class AppProxyProvider: NETransparentProxyProvider {
             }
             
             self?.relayClientToProxy(clientFlow: clientFlow, proxyConnection: proxyConnection)
-            self?.relayProxyToClient(clientFlow: clientFlow, proxyConnection: proxyConnection)
+            if initialData.isEmpty {
+                self?.relayProxyToClient(clientFlow: clientFlow, proxyConnection: proxyConnection)
+            } else {
+                // A tunnel payload can share a read with the end of the headers.
+                // Deliver it before starting further proxy-to-client reads.
+                clientFlow.write(initialData) { [weak self] error in
+                    if let error {
+                        self?.closeRelay(clientFlow, proxyConnection, error: error)
+                    } else {
+                        self?.relayProxyToClient(clientFlow: clientFlow, proxyConnection: proxyConnection)
+                    }
+                }
+            }
         }
     }
     

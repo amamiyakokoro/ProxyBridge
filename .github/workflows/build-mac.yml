@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Test routing logs and SOCKS5 domain encoding
         run: sh MacOS/tests/routing-logs.sh
+      - name: Test UDP lifetimes and proxy replies
+        run: sh MacOS/tests/provider-regressions.sh
       - name: Build unsigned extension
         run: |
           xcodebuild \

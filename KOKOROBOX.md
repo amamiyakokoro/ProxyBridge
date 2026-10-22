@@ -62,5 +62,14 @@ a 20-second deadline; UDP associations idle for 120 seconds are reaped by a
 session. Stop cancels pending handshakes and closes retained flows. TCP SOCKS5
 domain lengths use bounded UTF-8 byte counts.
 
+UDP teardown detaches both SOCKS5 and Mihomo DNS session handlers before
+cancellation. Read callbacks hold associations weakly and ignore replaced or
+closed associations. SOCKS5 CONNECT and UDP ASSOCIATE consume complete replies
+without reading tunnel payload bytes. HTTP CONNECT validates the status line,
+limits response headers to 16 KiB, and delivers any coalesced tunnel payload
+before starting subsequent relay reads.
+
 Run `sh MacOS/tests/routing-logs.sh` on macOS to check ring capacity, batched reads,
 clear, connection timestamps and concurrent access without activating an extension.
+Run `sh MacOS/tests/provider-regressions.sh` for UDP lifetime and proxy-reply
+regressions using transport stand-ins, also without extension activation.
