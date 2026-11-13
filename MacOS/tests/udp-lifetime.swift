@@ -68,7 +68,10 @@ extension AppProxyProvider {
             let oldDNSHandler = dns.handler!
             switch ending {
             case "control EOF": control.pendingRead?(nil, nil)
-            case "stop": provider.stopProxy(with: .userInitiated) {}
+            case "stop":
+                provider.stopProxy(with: .userInitiated) {}
+                let logs = provider.routingLogs.drain()
+                precondition(logs.contains { $0["message"] == "Tunnel stopping: stopped by the user (1)" })
             default: provider.teardownUDP(flow)
             }
             precondition(retained == nil, "Association leaked after \(ending)")

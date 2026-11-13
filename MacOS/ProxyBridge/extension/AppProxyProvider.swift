@@ -736,11 +736,17 @@ class AppProxyProvider: NETransparentProxyProvider {
         appendLog(.activity(timestamp: dateFormatter.string(from: Date()), level: level, message: message))
     }
 
+    private func logLifecycle(_ message: String, error: Bool = false) {
+        ProviderDiagnostics.note(message, error: error)
+        log(message, level: error ? "ERROR" : "INFO")
+    }
+
     private func appendLog(_ entry: RoutingLogEntry) {
         routingLogs.append(entry)
     }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
+        logLifecycle("Tunnel starting")
         handshakeLock.lock()
         proxyStopping = false
         handshakeLock.unlock()
@@ -750,6 +756,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             do {
                 try installKokoroBoxConfiguration(data)
             } catch {
+                logLifecycle("Could not load the tunnel routing configuration", error: true)
                 completionHandler(error)
                 return
             }
@@ -771,12 +778,19 @@ class AppProxyProvider: NETransparentProxyProvider {
         }
         
         self.setTunnelNetworkSettings(settings) { [weak self] error in
-            if error == nil { self?.startUDPSweepTimer() }
+            if let error {
+                let networkError = error as NSError
+                self?.logLifecycle("Could not apply the tunnel network settings (\(networkError.domain), code \(networkError.code))", error: true)
+            } else {
+                self?.startUDPSweepTimer()
+                self?.logLifecycle("Tunnel started")
+            }
             completionHandler(error)
         }
     }
     
     override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        logLifecycle("Tunnel stopping: \(ProviderDiagnostics.text(for: reason))")
         handshakeLock.lock()
         proxyStopping = true
         udpSweepTimer?.cancel()
