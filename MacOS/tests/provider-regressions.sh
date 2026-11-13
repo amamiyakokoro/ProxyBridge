@@ -9,6 +9,6 @@ for regression in udp-lifetime proxy-replies; do
         "$provider_source_dir/ProxyBridge/extension/AppProxyProvider.swift" >> "$provider_test_dir/main.swift"
     cat "$provider_source_dir/tests/$regression.swift" >> "$provider_test_dir/main.swift"
     swiftc -O -suppress-warnings -module-cache-path "$provider_test_dir/cache" \
-        "$provider_test_dir/main.swift" -o "$provider_test_dir/$regression"
+        "$provider_test_dir/main.swift" "$provider_source_dir/ProxyBridge/extension/FlowFailure.swift" -o "$provider_test_dir/$regression"
     "$provider_test_dir/$regression"
 done

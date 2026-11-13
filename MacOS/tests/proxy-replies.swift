@@ -41,6 +41,8 @@ private final class ReplyTCPFlow: NEAppProxyTCPFlow {
     var writes: [Data] = []
     var readCloses = 0
     var writeCloses = 0
+    var readCloseError: NSError?
+    var writeCloseError: NSError?
     var deferWrites = false
     var pendingWrites: [(Error?) -> Void] = []
     var pendingRead: ((Data?, Error?) -> Void)?
@@ -54,8 +56,15 @@ private final class ReplyTCPFlow: NEAppProxyTCPFlow {
         writes.append(data)
         if deferWrites { pendingWrites.append(completionHandler) } else { completionHandler(nil) }
     }
-    override func closeReadWithError(_ error: Error?) { readCloses += 1; pendingRead = nil }
-    override func closeWriteWithError(_ error: Error?) { writeCloses += 1 }
+    override func closeReadWithError(_ error: Error?) {
+        readCloses += 1
+        readCloseError = error as NSError?
+        pendingRead = nil
+    }
+    override func closeWriteWithError(_ error: Error?) {
+        writeCloses += 1
+        writeCloseError = error as NSError?
+    }
 }
 
 private final class ReplyUDPFlow: NEAppProxyUDPFlow {
@@ -164,12 +173,46 @@ extension AppProxyProvider {
             provider.teardownUDP(flow)
         }
 
+        func checkHandshakeFailure(_ flow: ReplyTCPFlow, _ connection: ReplyTCPConnection,
+                                   _ code: NEAppProxyFlowError.Code) {
+            precondition(flow.opens == 0 && connection.cancellations == 1)
+            precondition(provider.pendingHandshakes[ObjectIdentifier(connection)] == nil)
+            precondition(flow.readCloses == 1 && flow.writeCloses == 1)
+            for error in [flow.readCloseError, flow.writeCloseError] {
+                precondition(error?.domain == NEAppProxyFlowError.errorDomain && error?.code == code.rawValue)
+            }
+        }
+
+        let socksFailures: [(ReplyTCPConnection.Event, NEAppProxyFlowError.Code)] = [
+            (.bytes(Data([5, 5])), .refused),
+            (.bytes(Data([5, 4])), .hostUnreachable),
+            (.bytes(Data([5, 6])), .timedOut),
+            (.eof, .hostUnreachable)
+        ]
+        for (event, code) in socksFailures {
+            let connection = ReplyTCPConnection([.bytes(Data([5, 0])), event])
+            let flow = ReplyTCPFlow()
+            provider.pendingHandshakes[ObjectIdentifier(connection)] = PendingHandshake(token: UUID(), flow: flow, connection: connection)
+            provider.handleSOCKS5Proxy(clientFlow: flow, proxyConnection: connection, destination: "example.com",
+                                       port: 443, username: nil, password: nil)
+            checkHandshakeFailure(flow, connection, code)
+        }
+
         let rejectedConnection = ReplyTCPConnection([.bytes(rejection)])
         let rejectedFlow = ReplyTCPFlow()
         provider.pendingHandshakes[ObjectIdentifier(rejectedConnection)] = PendingHandshake(token: UUID(), flow: rejectedFlow, connection: rejectedConnection)
         provider.handleHTTPProxy(clientFlow: rejectedFlow, proxyConnection: rejectedConnection, destination: "example.com", port: 443, username: nil, password: nil)
-        precondition(rejectedFlow.opens == 0 && rejectedConnection.cancellations == 1,
-                     "A 407 containing 200 must not open a tunnel")
+        checkHandshakeFailure(rejectedFlow, rejectedConnection, .refused)
+
+        for (status, code) in [(502, NEAppProxyFlowError.Code.hostUnreachable), (504, .timedOut)] {
+            let response = Data("HTTP/1.1 \(status) Upstream error\r\n\r\n".utf8)
+            let connection = ReplyTCPConnection([.bytes(response)])
+            let flow = ReplyTCPFlow()
+            provider.pendingHandshakes[ObjectIdentifier(connection)] = PendingHandshake(token: UUID(), flow: flow, connection: connection)
+            provider.handleHTTPProxy(clientFlow: flow, proxyConnection: connection, destination: "example.com",
+                                     port: 443, username: nil, password: nil)
+            checkHandshakeFailure(flow, connection, code)
+        }
 
         let nextPayload = Data("next".utf8)
         let connection = ReplyTCPConnection([.bytes(headers + banner), .bytes(nextPayload), .eof])
